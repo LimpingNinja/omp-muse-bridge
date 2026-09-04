@@ -2,7 +2,7 @@
  * Shared vocabulary between the exec path (runtime.ts) and the session-host
  * path (msp.ts). This module MUST stay dependency-free (node builtins only) so
  * msp.ts remains loadable in plain `bun test` without the host-only
- * `@earendil-works/pi-coding-agent` resolution that runtime.ts requires.
+ * `@oh-my-pi/pi-coding-agent` resolution that runtime.ts requires.
  */
 
 export type MuseThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

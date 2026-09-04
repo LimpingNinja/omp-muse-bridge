@@ -7,12 +7,7 @@
     "strict": true,
     "skipLibCheck": true,
     "target": "es2024",
-    "typeRoots": ["../../plugins/node_modules/@types"],
-    "types": ["node"],
-    "paths": {
-      "@earendil-works/pi-ai": ["../../../.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/types/extensibility/legacy-pi-ai-shim.d.ts"],
-      "@earendil-works/pi-coding-agent": ["../../../.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/types/extensibility/legacy-pi-coding-agent-shim.d.ts"]
-    }
+    "types": ["node"]
   },
   "include": ["src/**/*.ts", "src/**/*.d.ts"]
 }

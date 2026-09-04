@@ -6,8 +6,8 @@ import {
 	createAssistantMessageEventStream,
 	type Model,
 	type SimpleStreamOptions,
-} from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+} from "@oh-my-pi/pi-ai";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { getMuseCatalog, type MuseCatalogModel } from "./catalog.ts";
 import { loadMuseSystemPrompt, runMuse } from "./runtime.ts";
 import { HostUnavailableError, runMuseTurn, shutdownHost, steerActiveMuseRuns, uuidv7 } from "./msp.ts";

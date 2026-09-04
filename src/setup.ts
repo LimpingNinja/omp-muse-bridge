@@ -1,8 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+// `parseFrontmatter`/`getAgentDir` live in the package's legacy-compat module. Both exist at runtime; the shipped
+// declarations omit `getAgentDir`, so it is typed here rather than reaching into internals.
+import { parseFrontmatter } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
+import * as legacyShim from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
+
 import { getBundledAgentPath } from "./runtime.ts";
+
+const getAgentDir: () => string = (legacyShim as unknown as { getAgentDir: () => string }).getAgentDir;
 
 const AGENT_FILE = "muse-spark.md";
 

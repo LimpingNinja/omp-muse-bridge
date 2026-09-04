@@ -290,17 +290,19 @@ export class TurnRun {
 		this.process(method, params);
 	}
 
-	/** Most informative argument for a tool call, by the field names Muse's tools actually use. */
-	private static primaryArgument(args: string): string {
-		let parsed: unknown;
+	/** Parsed tool arguments, or undefined when the model emitted non-JSON (the wire keeps `args` verbatim). */
+	private static toolArgs(args: string): Frame | undefined {
 		try {
-			parsed = JSON.parse(args);
+			return asRecord(JSON.parse(args));
 		} catch {
-			return "";
+			return undefined;
 		}
-		const record = asRecord(parsed);
+	}
+
+	/** Most informative argument for a tool call, by the field names Muse's tools actually use. */
+	private static primaryArgument(record: Frame | undefined): string {
 		if (!record) return "";
-		for (const key of ["path", "file_path", "filePath", "target_file", "command", "query", "url", "pattern", "glob", "objective", "prompt"]) {
+		for (const key of ["path", "file_path", "filePath", "target_file", "query", "url", "pattern", "glob", "command", "objective", "prompt"]) {
 			const value = record[key];
 			if (typeof value === "string" && value.trim()) {
 				const flat = value.replace(/\s+/g, " ").trim();
@@ -311,11 +313,32 @@ export class TurnRun {
 		return "";
 	}
 
-	/** Terminal-state detail: the tool's own bounded result text, first line only, so a call reports what it did. */
+	/** Muse's todo list rendered as readable lines, so a plan update is visible instead of an opaque tool call. */
+	private static todoLines(record: Frame | undefined): string {
+		if (!record || !Array.isArray(record.todos)) return "";
+		const lines = record.todos.slice(0, 20).map((entry) => {
+			const todo = asRecord(entry);
+			if (!todo) return "";
+			const label = text(todo.content) || text(todo.title) || text(todo.task);
+			if (!label) return "";
+			const state = text(todo.status) || text(todo.state) || "pending";
+			const flat = label.replace(/\s+/g, " ").trim();
+			return `  • ${state}: ${flat.length > 100 ? `${flat.slice(0, 99)}…` : flat}`;
+		}).filter(Boolean);
+		return lines.join("\n");
+	}
+
+	/**
+	 * Terminal-state detail. Deliberately NOT the tool's raw `visibleOutput` — that is file contents, listings and
+	 * command output the transcript is meant to stay free of. Only a failure reason, or a change summary the tool
+	 * itself stated in a recognizable form (e.g. `+12 -5`, `3 insertions`), is surfaced.
+	 */
 	private static resultSummary(item: Frame): string {
-		const output = text(item.visibleOutput).replace(/\s+/g, " ").trim();
-		if (!output) return "";
-		return output.length > 160 ? `${output.slice(0, 159)}…` : output;
+		const failure = text(item.failureReason).replace(/\s+/g, " ").trim();
+		if (failure) return failure.length > 160 ? `${failure.slice(0, 159)}…` : failure;
+		const output = text(item.visibleOutput);
+		const stats = /([+-]\d+\s+[+-]\d+)|(\d+\s+insertions?[^,]*,\s*\d+\s+deletions?)|(\d+\s+lines?\s+(?:added|removed|changed))/i.exec(output);
+		return stats ? stats[0].replace(/\s+/g, " ").trim() : "";
 	}
 
 	private emitItemProgress(method: string, item: Frame, tracked: TrackedItem): void {
@@ -328,14 +351,18 @@ export class TurnRun {
 		const fallback = rawFallback.length > 200 ? `${rawFallback.slice(0, 199)}…` : rawFallback;
 		let label: string;
 		let detail = "";
+		let body = "";
 		if (kind === "reasoning") label = "Muse reasoning";
 		else if (kind === "toolCall") {
 			const tool = text(item.tool) || "tool";
-			const target = TurnRun.primaryArgument(text(item.args));
-			label = `Muse ${tool}${target ? ` · ${target}` : ""}`;
+			const args = TurnRun.toolArgs(text(item.args));
+			label = `Muse ${tool}${TurnRun.primaryArgument(args) ? ` · ${TurnRun.primaryArgument(args)}` : ""}`;
 			detail = terminal ? TurnRun.resultSummary(item) : "";
+			// A todo update is a plan, not a tool result: show the list itself once, when the call opens.
+			if (!terminal && /todo/i.test(tool)) body = TurnRun.todoLines(args);
 		} else if (kind === "userShell") {
-			label = `Muse shell${text(item.command) ? ` · ${text(item.command)}` : ""}`;
+			const command = text(item.commandText).replace(/\s+/g, " ").trim();
+			label = `Muse shell${command ? ` · ${command.length > 120 ? `${command.slice(0, 119)}…` : command}` : ""}`;
 			detail = terminal ? TurnRun.resultSummary(item) : "";
 		} else if (kind === "subagent") label = `Muse subagent${text(item.role) ? ` · ${text(item.role)}` : ""}`;
 		else if (kind === "workflow") label = `Muse workflow${text(item.scriptId) ? ` · ${text(item.scriptId)}` : ""}`;
@@ -343,7 +370,7 @@ export class TurnRun {
 		else if (kind === "reminderChild") label = "Muse reminder";
 		else label = `Muse ${kind}`;
 		const suffix = detail || fallback;
-		const message = `${label} — ${status}${suffix ? `: ${suffix}` : ""}`;
+		const message = `${label} — ${status}${suffix ? `: ${suffix}` : ""}${body ? `\n${body}` : ""}`;
 		if (message === tracked.lastActivity) return;
 		tracked.lastActivity = message;
 		const delta = `\n\n${message}\n`;
@@ -513,7 +540,9 @@ export class TurnRun {
 
 	async steer(input: Frame[], expectedTurnId?: string, thinkingLevel?: MuseThinkingLevel): Promise<boolean> {
 		const turnId = expectedTurnId ?? this.turnId;
-		if (!turnId || this.settled || this.terminalResolved) return false;
+		// `interrupted` matters as much as `settled`: during the post-abort grace the run is still registered, and a
+		// message typed right after ESC must start a fresh turn instead of being swallowed as a steer.
+		if (!turnId || this.settled || this.terminalResolved || this.interrupted) return false;
 		const reasoningEffort = museThinkingLevel(thinkingLevel) ?? this.reasoningEffort;
 		try {
 			await this.host.request("turn/steer", {
