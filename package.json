@@ -1,0 +1,40 @@
+{
+  "name": "omp-muse-bridge",
+  "version": "0.4.0",
+  "description": "OMP-pinned Muse Spark bridge with session continuity",
+  "type": "module",
+  "main": "src/index.ts",
+  "keywords": ["pi","pi-extension","pi-package","muse","muse-spark","meta","subagent"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LimpingNinja/omp-muse-bridge.git"
+  },
+  "homepage": "https://github.com/LimpingNinja/omp-muse-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/LimpingNinja/omp-muse-bridge/issues"
+  },
+  "files": ["src","agents","README.md"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit && for file in src/*.ts; do node --check \"$file\" || exit 1; done",
+    "test": "bun test test/",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
