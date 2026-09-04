@@ -1,1 +1,33 @@
-{"$schema": "https://anthropic.com/claude-code/marketplace.schema.json", "author": {"name": "LimpingNinja"}, "metadata": {"description": "Oh My Pi marketplace for the omp-muse-bridge plugin", "version": "0.4.0"}, "name": "omp-muse-bridge", "owner": {"name": "LimpingNinja"}, "plugins": [{"category": "development", "description": "Use Muse Spark as an agent in OMP through an authenticated Muse Code installation, with session continuity over a persistent host", "homepage": "https://github.com/LimpingNinja/omp-muse-bridge#readme", "keywords": ["omp", "omp-plugin", "muse", "muse-spark", "subagent"], "license": "MIT", "name": "omp-muse-bridge", "repository": "https://github.com/LimpingNinja/omp-muse-bridge", "source": "./", "version": "0.4.0"}]}
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "author": {
+    "name": "LimpingNinja"
+  },
+  "metadata": {
+    "description": "Oh My Pi marketplace for the omp-muse-bridge plugin",
+    "version": "0.4.1"
+  },
+  "name": "omp-muse-bridge",
+  "owner": {
+    "name": "LimpingNinja"
+  },
+  "plugins": [
+    {
+      "category": "development",
+      "description": "Use Muse Spark as an agent in OMP through an authenticated Muse Code installation, with session continuity over a persistent host",
+      "homepage": "https://github.com/LimpingNinja/omp-muse-bridge#readme",
+      "keywords": [
+        "omp",
+        "omp-plugin",
+        "muse",
+        "muse-spark",
+        "subagent"
+      ],
+      "license": "MIT",
+      "name": "omp-muse-bridge",
+      "repository": "https://github.com/LimpingNinja/omp-muse-bridge",
+      "source": "./",
+      "version": "0.4.1"
+    }
+  ]
+}

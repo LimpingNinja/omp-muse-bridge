@@ -348,9 +348,15 @@ export class TurnRun {
 	/** Hosts a web tool actually reached, so a search reports its sources without pasting page text. */
 	private static resultSites(item: Frame): string {
 		const hosts: string[] = [];
-		// Stop at whitespace, quotes, brackets, or a literal `\` escape (tool output embeds `\n` sequences verbatim).
-		for (const match of text(item.visibleOutput).matchAll(/https?:\/\/([^\s/"'<>)\]\\]+)/g)) {
-			const host = (match[1] ?? "").replace(/^www\./, "").replace(/[.,;:]+$/, "");
+		for (const match of text(item.visibleOutput).matchAll(/https?:\/\/\S+/g)) {
+			let host = "";
+			try {
+				// Trim characters that commonly trail a URL in prose/JSON before parsing.
+				host = new URL(match[0].replace(/[)\]}>"',.;:]+$/, "").replace(/\\[a-z].*$/i, "")).hostname;
+			} catch {
+				continue;
+			}
+			host = host.replace(/^www\./, "");
 			if (host && !hosts.includes(host)) hosts.push(host);
 			if (hosts.length === 5) break;
 		}
@@ -371,30 +377,35 @@ export class TurnRun {
 			const tool = text(item.tool) || "tool";
 			const args = TurnRun.toolArgs(text(item.args));
 			const target = TurnRun.primaryArgument(args);
-			if (!terminal) {
+			// A todo update is a plan, not tool noise: show the list and hide the call itself entirely.
+			if (/todo/i.test(tool)) {
+				if (terminal) return;
+				const lines = TurnRun.todoLines(args);
+				if (!lines) return;
+				message = `[Muse] plan:\n${lines}`;
+			} else if (!terminal) {
 				message = /^web_search$/i.test(tool)
-					? `Muse searched: ${target || "(query unavailable)"}`
+					? `[Muse] searched: ${target || "(query unavailable)"}`
 					: /^web_fetch$/i.test(tool)
-						? `Muse fetched ${target || "(url unavailable)"}`
-						: `Muse called ${tool}${target ? ` on ${target}` : ""}`;
-				if (/todo/i.test(tool)) body = TurnRun.todoLines(args);
+						? `[Muse] fetched ${target || "(url unavailable)"}`
+						: `[Muse] called ${tool}${target ? ` on ${target}` : ""}`;
 			} else {
 				const sites = /^web_(search|fetch)$/i.test(tool) ? TurnRun.resultSites(item) : "";
 				const detail = sites ? `sources: ${sites}` : TurnRun.resultSummary(item) || fallback;
 				const outcome = status === "completed" ? "finished" : status;
-				message = `Muse ${tool} ${outcome}${target ? ` on ${target}` : ""}${detail ? ` — ${detail}` : ""}`;
+				message = `[Muse] ${tool} ${outcome}${target ? ` on ${target}` : ""}${detail ? ` — ${detail}` : ""}`;
 			}
 		} else {
 			let label: string;
-			if (kind === "reasoning") label = "Muse reasoning";
+			if (kind === "reasoning") label = "[Muse] reasoning";
 			else if (kind === "userShell") {
 				const command = text(item.commandText).replace(/\s+/g, " ").trim();
-				label = `Muse shell${command ? ` · ${command.length > 120 ? `${command.slice(0, 119)}…` : command}` : ""}`;
-			} else if (kind === "subagent") label = `Muse subagent${text(item.role) ? ` · ${text(item.role)}` : ""}`;
-			else if (kind === "workflow") label = `Muse workflow${text(item.scriptId) ? ` · ${text(item.scriptId)}` : ""}`;
-			else if (kind === "compaction") label = "Muse compaction";
-			else if (kind === "reminderChild") label = "Muse reminder";
-			else label = `Muse ${kind}`;
+				label = `[Muse] shell${command ? ` · ${command.length > 120 ? `${command.slice(0, 119)}…` : command}` : ""}`;
+			} else if (kind === "subagent") label = `[Muse] subagent${text(item.role) ? ` · ${text(item.role)}` : ""}`;
+			else if (kind === "workflow") label = `[Muse] workflow${text(item.scriptId) ? ` · ${text(item.scriptId)}` : ""}`;
+			else if (kind === "compaction") label = "[Muse] compaction";
+			else if (kind === "reminderChild") label = "[Muse] reminder";
+			else label = `[Muse] ${kind}`;
 			const suffix = (terminal ? TurnRun.resultSummary(item) : "") || fallback;
 			message = `${label} — ${status}${suffix ? `: ${suffix}` : ""}`;
 		}
@@ -427,7 +438,7 @@ export class TurnRun {
 				this.turnId = startedTurnId;
 			}
 			if (!startedTurnId || startedTurnId !== this.turnId) return;
-			this.onActivityDelta?.("\n\nMuse turn — started\n");
+			this.onActivityDelta?.("\n\n[Muse] turn started\n");
 			return;
 		}
 		if (method === "item/started" || method === "item/updated" || method === "item/completed") {
