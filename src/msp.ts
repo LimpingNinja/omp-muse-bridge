@@ -372,7 +372,6 @@ export class TurnRun {
 		const rawFallback = text(item.fallbackText).replace(/\s+/g, " ").trim();
 		const fallback = rawFallback.length > 200 ? `${rawFallback.slice(0, 199)}…` : rawFallback;
 		let message: string;
-		let body = "";
 		if (kind === "toolCall") {
 			const tool = text(item.tool) || "tool";
 			const args = TurnRun.toolArgs(text(item.args));
@@ -409,7 +408,6 @@ export class TurnRun {
 			const suffix = (terminal ? TurnRun.resultSummary(item) : "") || fallback;
 			message = `${label} — ${status}${suffix ? `: ${suffix}` : ""}`;
 		}
-		if (body) message = `${message}\n${body}`;
 		if (message === tracked.lastActivity) return;
 		tracked.lastActivity = message;
 		const delta = `\n\n${message}\n`;
