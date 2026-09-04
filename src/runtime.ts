@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseFrontmatter } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
+import { parseFrontmatter } from "@oh-my-pi/pi-utils";
 import { resolveMuseModelId } from "./catalog.ts";
 import { errorMessage } from "./utils.ts";
 
@@ -68,8 +68,9 @@ export function getBundledAgentPath(): string {
 
 export function loadMuseSystemPrompt(): string {
 	const filePath = getBundledAgentPath();
-	const { frontmatter, body } = parseFrontmatter<Record<string, string>>(fs.readFileSync(filePath, "utf8"));
-	if (frontmatter.name !== "muse-spark" || !frontmatter.description || !body.trim()) {
+	const { frontmatter, body } = parseFrontmatter(fs.readFileSync(filePath, "utf8"));
+	const meta = frontmatter as Record<string, unknown>;
+	if (meta.name !== "muse-spark" || !meta.description || !body.trim()) {
 		throw new Error(`Invalid bundled Muse agent definition: ${filePath}`);
 	}
 	return body.trim();

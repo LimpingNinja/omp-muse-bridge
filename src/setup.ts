@@ -1,14 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-// `parseFrontmatter`/`getAgentDir` live in the package's legacy-compat module. Both exist at runtime; the shipped
-// declarations omit `getAgentDir`, so it is typed here rather than reaching into internals.
-import { parseFrontmatter } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
-import * as legacyShim from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-coding-agent-shim";
+import { getAgentDir, parseFrontmatter } from "@oh-my-pi/pi-utils";
 
 import { getBundledAgentPath } from "./runtime.ts";
 
-const getAgentDir: () => string = (legacyShim as unknown as { getAgentDir: () => string }).getAgentDir;
 
 const AGENT_FILE = "muse-spark.md";
 
@@ -34,11 +30,13 @@ function isManagedAgent(filePath: string, stat: fs.Stats): boolean {
 			return target === getBundledAgentPath();
 		}
 		if (!stat.isFile()) return false;
-		const { frontmatter } = parseFrontmatter<Record<string, string>>(fs.readFileSync(filePath, "utf8"));
+		const { frontmatter } = parseFrontmatter(fs.readFileSync(filePath, "utf8"));
+		const meta = frontmatter as Record<string, unknown>;
+		const model = typeof meta.model === "string" ? meta.model : "";
 		// Accept the historical `pi-muse-bridge` marker so agent files written before the rename stay managed.
-		return (frontmatter["managed-by"] === "omp-muse-bridge" || frontmatter["managed-by"] === "pi-muse-bridge")
-			&& frontmatter.name === "muse-spark"
-			&& frontmatter.model?.startsWith("muse-code/") === true;
+		return (meta["managed-by"] === "omp-muse-bridge" || meta["managed-by"] === "pi-muse-bridge")
+			&& meta.name === "muse-spark"
+			&& model.startsWith("muse-code/");
 	} catch {
 		return false;
 	}

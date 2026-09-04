@@ -313,19 +313,23 @@ export class TurnRun {
 		return "";
 	}
 
-	/** Muse's todo list rendered as readable lines, so a plan update is visible instead of an opaque tool call. */
+	/**
+	 * Muse's todo list rendered as readable lines, so a plan update is visible instead of an opaque tool call.
+	 * Muse spells the collection `todos` or `items`, and the entry label `text` (also seen: content/title/task).
+	 */
 	private static todoLines(record: Frame | undefined): string {
-		if (!record || !Array.isArray(record.todos)) return "";
-		const lines = record.todos.slice(0, 20).map((entry) => {
+		if (!record) return "";
+		const entries = Array.isArray(record.todos) ? record.todos : Array.isArray(record.items) ? record.items : undefined;
+		if (!entries) return "";
+		return entries.slice(0, 20).map((entry) => {
 			const todo = asRecord(entry);
 			if (!todo) return "";
-			const label = text(todo.content) || text(todo.title) || text(todo.task);
+			const label = text(todo.text) || text(todo.content) || text(todo.title) || text(todo.task);
 			if (!label) return "";
 			const state = text(todo.status) || text(todo.state) || "pending";
 			const flat = label.replace(/\s+/g, " ").trim();
 			return `  • ${state}: ${flat.length > 100 ? `${flat.slice(0, 99)}…` : flat}`;
-		}).filter(Boolean);
-		return lines.join("\n");
+		}).filter(Boolean).join("\n");
 	}
 
 	/**
@@ -341,6 +345,18 @@ export class TurnRun {
 		return stats ? stats[0].replace(/\s+/g, " ").trim() : "";
 	}
 
+	/** Hosts a web tool actually reached, so a search reports its sources without pasting page text. */
+	private static resultSites(item: Frame): string {
+		const hosts: string[] = [];
+		// Stop at whitespace, quotes, brackets, or a literal `\` escape (tool output embeds `\n` sequences verbatim).
+		for (const match of text(item.visibleOutput).matchAll(/https?:\/\/([^\s/"'<>)\]\\]+)/g)) {
+			const host = (match[1] ?? "").replace(/^www\./, "").replace(/[.,;:]+$/, "");
+			if (host && !hosts.includes(host)) hosts.push(host);
+			if (hosts.length === 5) break;
+		}
+		return hosts.join(", ");
+	}
+
 	private emitItemProgress(method: string, item: Frame, tracked: TrackedItem): void {
 		const kind = tracked.kind;
 		if (kind === "userMessage" || kind === "agentMessage") return;
@@ -349,28 +365,40 @@ export class TurnRun {
 		const terminal = status !== "started";
 		const rawFallback = text(item.fallbackText).replace(/\s+/g, " ").trim();
 		const fallback = rawFallback.length > 200 ? `${rawFallback.slice(0, 199)}…` : rawFallback;
-		let label: string;
-		let detail = "";
+		let message: string;
 		let body = "";
-		if (kind === "reasoning") label = "Muse reasoning";
-		else if (kind === "toolCall") {
+		if (kind === "toolCall") {
 			const tool = text(item.tool) || "tool";
 			const args = TurnRun.toolArgs(text(item.args));
-			label = `Muse ${tool}${TurnRun.primaryArgument(args) ? ` · ${TurnRun.primaryArgument(args)}` : ""}`;
-			detail = terminal ? TurnRun.resultSummary(item) : "";
-			// A todo update is a plan, not a tool result: show the list itself once, when the call opens.
-			if (!terminal && /todo/i.test(tool)) body = TurnRun.todoLines(args);
-		} else if (kind === "userShell") {
-			const command = text(item.commandText).replace(/\s+/g, " ").trim();
-			label = `Muse shell${command ? ` · ${command.length > 120 ? `${command.slice(0, 119)}…` : command}` : ""}`;
-			detail = terminal ? TurnRun.resultSummary(item) : "";
-		} else if (kind === "subagent") label = `Muse subagent${text(item.role) ? ` · ${text(item.role)}` : ""}`;
-		else if (kind === "workflow") label = `Muse workflow${text(item.scriptId) ? ` · ${text(item.scriptId)}` : ""}`;
-		else if (kind === "compaction") label = "Muse compaction";
-		else if (kind === "reminderChild") label = "Muse reminder";
-		else label = `Muse ${kind}`;
-		const suffix = detail || fallback;
-		const message = `${label} — ${status}${suffix ? `: ${suffix}` : ""}${body ? `\n${body}` : ""}`;
+			const target = TurnRun.primaryArgument(args);
+			if (!terminal) {
+				message = /^web_search$/i.test(tool)
+					? `Muse searched: ${target || "(query unavailable)"}`
+					: /^web_fetch$/i.test(tool)
+						? `Muse fetched ${target || "(url unavailable)"}`
+						: `Muse called ${tool}${target ? ` on ${target}` : ""}`;
+				if (/todo/i.test(tool)) body = TurnRun.todoLines(args);
+			} else {
+				const sites = /^web_(search|fetch)$/i.test(tool) ? TurnRun.resultSites(item) : "";
+				const detail = sites ? `sources: ${sites}` : TurnRun.resultSummary(item) || fallback;
+				const outcome = status === "completed" ? "finished" : status;
+				message = `Muse ${tool} ${outcome}${target ? ` on ${target}` : ""}${detail ? ` — ${detail}` : ""}`;
+			}
+		} else {
+			let label: string;
+			if (kind === "reasoning") label = "Muse reasoning";
+			else if (kind === "userShell") {
+				const command = text(item.commandText).replace(/\s+/g, " ").trim();
+				label = `Muse shell${command ? ` · ${command.length > 120 ? `${command.slice(0, 119)}…` : command}` : ""}`;
+			} else if (kind === "subagent") label = `Muse subagent${text(item.role) ? ` · ${text(item.role)}` : ""}`;
+			else if (kind === "workflow") label = `Muse workflow${text(item.scriptId) ? ` · ${text(item.scriptId)}` : ""}`;
+			else if (kind === "compaction") label = "Muse compaction";
+			else if (kind === "reminderChild") label = "Muse reminder";
+			else label = `Muse ${kind}`;
+			const suffix = (terminal ? TurnRun.resultSummary(item) : "") || fallback;
+			message = `${label} — ${status}${suffix ? `: ${suffix}` : ""}`;
+		}
+		if (body) message = `${message}\n${body}`;
 		if (message === tracked.lastActivity) return;
 		tracked.lastActivity = message;
 		const delta = `\n\n${message}\n`;
