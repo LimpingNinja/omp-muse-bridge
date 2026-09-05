@@ -1,9 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { getAgentDir, parseFrontmatter } from "@oh-my-pi/pi-utils";
+import { getAgentDir, parseFrontmatter, withFileLock } from "@oh-my-pi/pi-utils";
 
 import { getBundledAgentPath } from "./runtime.ts";
+import { errorMessage } from "./utils.ts";
 
 
 const AGENT_FILE = "muse-spark.md";
@@ -30,10 +31,9 @@ function isManagedAgent(filePath: string, stat: fs.Stats): boolean {
 			return target === getBundledAgentPath();
 		}
 		if (!stat.isFile()) return false;
-		const { frontmatter } = parseFrontmatter(fs.readFileSync(filePath, "utf8"));
-		const meta = frontmatter as Record<string, unknown>;
+		const { frontmatter: meta } = parseFrontmatter(fs.readFileSync(filePath, "utf8"), { rawKeys: true });
 		const model = typeof meta.model === "string" ? meta.model : "";
-		// Accept the historical `pi-muse-bridge` marker so agent files written before the rename stay managed.
+		// Definitions installed before the package rename remain managed.
 		return (meta["managed-by"] === "omp-muse-bridge" || meta["managed-by"] === "pi-muse-bridge")
 			&& meta.name === "muse-spark"
 			&& model.startsWith("muse-code/");
@@ -42,44 +42,65 @@ function isManagedAgent(filePath: string, stat: fs.Stats): boolean {
 	}
 }
 
-function copyAgent(source: string, destination: string): void {
-	fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
-	fs.chmodSync(destination, 0o600);
+/** Prepare a private replacement before changing the installed definition. */
+function installAgentAtomic(source: string, destination: string, replacing: boolean): void {
+	const directory = fs.mkdtempSync(path.join(path.dirname(destination), ".muse-agent-"));
+	const staged = path.join(directory, AGENT_FILE);
+	try {
+		fs.copyFileSync(source, staged, fs.constants.COPYFILE_EXCL);
+		fs.chmodSync(staged, 0o600);
+		if (replacing) {
+			const current = lstatIfPresent(destination);
+			if (!current || !isManagedAgent(destination, current)) {
+				throw new Error(`Agent changed during installation; refusing to replace ${destination}`);
+			}
+			fs.renameSync(staged, destination);
+		} else {
+			// A concurrent unrelated writer must not be overwritten by a fresh installation.
+			fs.linkSync(staged, destination);
+		}
+	} finally {
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
 }
 
-export function installMuseAgent(agentDir = path.join(getAgentDir(), "agents")): AgentSetupResult {
+/** Install or update a managed definition without overwriting an unrelated agent. */
+export async function installMuseAgent(agentDir = path.join(getAgentDir(), "agents")): Promise<AgentSetupResult> {
 	const source = getBundledAgentPath();
 	const destination = path.join(agentDir, AGENT_FILE);
 	fs.mkdirSync(agentDir, { recursive: true });
-	const existing = lstatIfPresent(destination);
-	if (existing && !isManagedAgent(destination, existing)) {
-		throw new Error(`Refusing to overwrite unrelated agent: ${destination}`);
-	}
-	if (existing?.isFile() && fs.readFileSync(destination, "utf8") === fs.readFileSync(source, "utf8")) {
-		return { path: destination, status: "unchanged", method: "copy" };
-	}
-	if (existing) fs.rmSync(destination, { force: true });
-	copyAgent(source, destination);
-	return { path: destination, status: existing ? "updated" : "installed", method: "copy" };
+	return withFileLock(destination, async () => {
+		const existing = lstatIfPresent(destination);
+		if (existing && !isManagedAgent(destination, existing)) {
+			throw new Error(`Refusing to overwrite unrelated agent: ${destination}`);
+		}
+		if (existing?.isFile() && fs.readFileSync(destination, "utf8") === fs.readFileSync(source, "utf8")) {
+			return { path: destination, status: "unchanged", method: "copy" };
+		}
+		installAgentAtomic(source, destination, existing !== null);
+		return { path: destination, status: existing ? "updated" : "installed", method: "copy" };
+	});
 }
 
-export function removeMuseAgent(agentDir = path.join(getAgentDir(), "agents")): AgentSetupResult {
+/** Remove only a definition owned by this bridge, under the installation lock. */
+export async function removeMuseAgent(agentDir = path.join(getAgentDir(), "agents")): Promise<AgentSetupResult> {
 	const destination = path.join(agentDir, AGENT_FILE);
-	const existing = lstatIfPresent(destination);
-	if (!existing) return { path: destination, status: "absent" };
-	if (!isManagedAgent(destination, existing)) {
-		throw new Error(`Refusing to remove unrelated agent: ${destination}`);
-	}
-	fs.rmSync(destination, { force: true });
-	return { path: destination, status: "removed" };
+	if (!lstatIfPresent(destination)) return { path: destination, status: "absent" };
+	return withFileLock(destination, async () => {
+		const existing = lstatIfPresent(destination);
+		if (!existing) return { path: destination, status: "absent" };
+		if (!isManagedAgent(destination, existing)) throw new Error(`Refusing to remove unrelated agent: ${destination}`);
+		fs.rmSync(destination, { force: true });
+		return { path: destination, status: "removed" };
+	});
 }
 
 export function registerMuseSetupCommands(pi: ExtensionAPI): void {
 	pi.registerCommand("muse-setup", {
-		description: "Install the muse-spark definition for Pi's official subagent tool",
+		description: "Install the muse-spark definition for OMP's task tool",
 		handler: async (_args, ctx) => {
 			try {
-				const result = installMuseAgent();
+				const result = await installMuseAgent();
 				ctx.ui.notify(
 					result.status === "unchanged"
 						? `Muse subagent is already installed: ${result.path}`
@@ -87,8 +108,7 @@ export function registerMuseSetupCommands(pi: ExtensionAPI): void {
 					"info",
 				);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(message, "error");
+				ctx.ui.notify(errorMessage(error), "error");
 			}
 		},
 	});
@@ -96,7 +116,7 @@ export function registerMuseSetupCommands(pi: ExtensionAPI): void {
 		description: "Remove the muse-spark definition managed by omp-muse-bridge",
 		handler: async (_args, ctx) => {
 			try {
-				const result = removeMuseAgent();
+				const result = await removeMuseAgent();
 				ctx.ui.notify(
 					result.status === "absent"
 						? `Muse subagent is not installed: ${result.path}`
@@ -104,8 +124,7 @@ export function registerMuseSetupCommands(pi: ExtensionAPI): void {
 					"info",
 				);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(message, "error");
+				ctx.ui.notify(errorMessage(error), "error");
 			}
 		},
 	});

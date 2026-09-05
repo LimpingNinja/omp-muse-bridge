@@ -1,8 +1,9 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 import { parseFrontmatter } from "@oh-my-pi/pi-utils";
 import { resolveMuseModelId } from "./catalog.ts";
 import { errorMessage } from "./utils.ts";
@@ -37,8 +38,8 @@ const EMPTY_USAGE: MuseUsage = {
 	output: 0,
 	cacheRead: 0,
 	cacheWrite: 0,
+	totalTokens: 0,
 	cost: 0,
-	contextTokens: 0,
 	turns: 0,
 };
 
@@ -76,37 +77,109 @@ export function loadMuseSystemPrompt(): string {
 	return body.trim();
 }
 
+/** Create a private prompt file, removing the directory if its write fails. */
 async function writeMusePrompt(prompt: string): Promise<{ dir: string; filePath: string }> {
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-muse-"));
 	const filePath = path.join(dir, "prompt.md");
-	// OMP lacks upstream's withFileMutationQueue; mkdtemp already guarantees a unique path,
-	// so a plain write is safe. mode 0o600 keeps the prompt private.
-	await fs.promises.writeFile(filePath, prompt, { encoding: "utf8", mode: 0o600 });
+	try {
+		// mkdtemp guarantees a unique path; mode 0o600 keeps the prompt private.
+		await fs.promises.writeFile(filePath, prompt, { encoding: "utf8", mode: 0o600 });
+	} catch (writeError) {
+		let cleanupError: unknown;
+		try {
+			await fs.promises.rm(dir, { recursive: true, force: true });
+		} catch (error) {
+			cleanupError = error;
+		}
+		if (cleanupError === undefined) throw writeError;
+		throw new AggregateError([writeError, cleanupError], "Muse prompt write failed and its cleanup failed");
+	}
 	return { dir, filePath };
 }
 
-function numeric(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function readUsage(payload: unknown, current: MuseUsage): MuseUsage {
-	if (!payload || typeof payload !== "object") return current;
-	const record = payload as Record<string, unknown>;
-	const nested = record.usage && typeof record.usage === "object"
+/** Preserve absent usage fields, accept zero counters, and keep totals separate from context occupancy. */
+function readUsage(record: Record<string, unknown>, current: MuseUsage): MuseUsage {
+	const nested = record.usage && typeof record.usage === "object" && !Array.isArray(record.usage)
 		? record.usage as Record<string, unknown>
 		: record;
-	return {
-		input: numeric(nested.input_tokens ?? nested.input) || current.input,
-		output: numeric(nested.output_tokens ?? nested.output) || current.output,
-		cacheRead: numeric(nested.cache_read_tokens ?? nested.cached_tokens ?? nested.cacheRead) || current.cacheRead,
-		cacheWrite: numeric(nested.cache_write_tokens ?? nested.cacheWrite) || current.cacheWrite,
-		cost: numeric(nested.cost ?? nested.cost_total) || current.cost,
-		contextTokens: numeric(nested.context_tokens ?? nested.total_tokens ?? nested.contextTokens) || current.contextTokens,
-		turns: numeric(nested.turns) || current.turns,
+	const pick = (...keys: string[]): number | undefined => {
+		for (const key of keys) {
+			const value = nested[key];
+			if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+		}
+		return undefined;
 	};
+	const cacheRead = pick("cache_read_tokens", "cached_tokens", "cacheRead");
+	const cacheWrite = pick("cache_write_tokens", "cacheWrite");
+	const promptTotal = pick("prompt_tokens", "promptTokens");
+	const inputFromPromptTotal = promptTotal === undefined
+		? undefined
+		: Math.max(0, promptTotal - (cacheRead ?? current.cacheRead) - (cacheWrite ?? current.cacheWrite));
+	const input = inputFromPromptTotal ?? pick("input_tokens", "input");
+	const output = pick("output_tokens", "output");
+	const contextTokens = pick("context_tokens", "contextTokens");
+	const serverTotal = pick("total_tokens", "totalTokens");
+	const cost = pick("cost", "cost_total");
+	const turns = pick("turns");
+	const countersChanged = input !== undefined || output !== undefined || cacheRead !== undefined || cacheWrite !== undefined;
+	if (!countersChanged && serverTotal === undefined && contextTokens === undefined && cost === undefined && turns === undefined) return current;
+	const merged: MuseUsage = {
+		input: input ?? current.input,
+		output: output ?? current.output,
+		cacheRead: cacheRead ?? current.cacheRead,
+		cacheWrite: cacheWrite ?? current.cacheWrite,
+		totalTokens: 0,
+		cost: cost ?? current.cost,
+		contextTokens: contextTokens ?? current.contextTokens,
+		turns: turns ?? current.turns,
+	};
+	merged.totalTokens = serverTotal ?? (countersChanged ? merged.input + merged.output + merged.cacheRead + merged.cacheWrite : current.totalTokens);
+	return merged;
 }
 
+function processGroupExists(pid: number): boolean {
+	try {
+		process.kill(-pid, 0);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
+		throw error;
+	}
+}
+
+/** Stop only the spawned process tree and await escalation even if its leader exits first. */
+async function stopProcessTree(child: ChildProcess): Promise<void> {
+	if (child.pid === undefined) return;
+	const pid = child.pid;
+	if (process.platform === "win32") {
+		await new Promise<void>((resolve, reject) => {
+			const killer = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { shell: false, stdio: "ignore" });
+			killer.once("error", reject);
+			killer.once("close", (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with code ${code}`)));
+		});
+		return;
+	}
+	const signal = (value: NodeJS.Signals) => {
+		try {
+			process.kill(-pid, value);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+		}
+	};
+	signal("SIGTERM");
+	const grace = Date.now() + 5_000;
+	while (processGroupExists(pid) && Date.now() < grace) await delay(50);
+	if (!processGroupExists(pid)) return;
+	signal("SIGKILL");
+	const confirmation = Date.now() + 1_000;
+	while (processGroupExists(pid) && Date.now() < confirmation) await delay(50);
+	if (processGroupExists(pid)) throw new Error("Muse process-group termination could not be confirmed");
+}
+
+/** Run the headless exec transport and clean up its prompt and cancellation resources. */
 export async function runMuse(request: MuseRunRequest): Promise<MuseRunResult> {
+	if (request.signal?.aborted) throw new Error("Muse run was aborted");
 	let stat: fs.Stats;
 	try {
 		stat = fs.statSync(request.cwd);
@@ -128,6 +201,7 @@ export async function runMuse(request: MuseRunRequest): Promise<MuseRunResult> {
 	const diagnostics: string[] = [];
 	let result: MuseRunResult | undefined;
 	let executionError: unknown;
+	let cancellationError: unknown;
 
 	try {
 		const args = getMuseExecArgs(
@@ -146,26 +220,38 @@ export async function runMuse(request: MuseRunRequest): Promise<MuseRunResult> {
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
+			child.stdout.setEncoding("utf8");
+			child.stderr.setEncoding("utf8");
 			let buffer = "";
-			let killTimer: NodeJS.Timeout | undefined;
+			let closed = false;
+			let closeCode = 1;
+			let cancellationPending = false;
+			const finishClose = () => {
+				if (closed && !cancellationPending) resolve(closeCode);
+			};
 
 			const processLine = (line: string) => {
 				if (!line.trim() || line.startsWith("muse:")) return;
-				let event: Record<string, unknown>;
+				let decoded: unknown;
 				try {
-					event = JSON.parse(line) as Record<string, unknown>;
+					decoded = JSON.parse(line);
 				} catch (error) {
 					if (line.trimStart().startsWith("{")) {
 						diagnostics.push(`Failed to parse Muse JSON: ${errorMessage(error)} — ${line.slice(0, 200)}`);
 					}
 					return;
 				}
+				if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+					diagnostics.push("Muse sent a non-object exec event; ignoring it");
+					return;
+				}
+				const event = decoded as Record<string, unknown>;
 				const eventSessionId = event.stream && typeof event.stream === "object"
 					? (event.stream as Record<string, unknown>).id
 					: undefined;
 				if (typeof eventSessionId === "string") resultSessionId = eventSessionId;
 				const payloadType = typeof event.payload_type === "string" ? event.payload_type : "";
-				const payload = event.payload && typeof event.payload === "object"
+				const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
 					? event.payload as Record<string, unknown>
 					: {};
 				usage = readUsage(payload, usage);
@@ -185,39 +271,26 @@ export async function runMuse(request: MuseRunRequest): Promise<MuseRunResult> {
 				}
 			};
 
-			child.stdout.on("data", (chunk) => {
-				buffer += chunk.toString();
+			child.stdout.on("data", (chunk: string) => {
+				buffer += chunk;
 				const lines = buffer.split("\n");
 				buffer = lines.pop() ?? "";
 				for (const line of lines) processLine(line);
 			});
-			child.stderr.on("data", (chunk) => {
-				stderr += chunk.toString();
+			child.stderr.on("data", (chunk: string) => {
+				stderr += chunk;
 			});
 
-			const killTree = (signal: NodeJS.Signals) => {
-				if (child.pid === undefined) return;
-				try {
-					if (useProcessGroup) process.kill(-child.pid, signal);
-					else {
-						const taskkillArgs = ["/pid", String(child.pid), "/t"];
-						if (signal === "SIGKILL") taskkillArgs.push("/f");
-						const killer = spawn("taskkill", taskkillArgs, { shell: false, stdio: "ignore" });
-						killer.unref();
-					}
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-						diagnostics.push(`Failed to stop Muse process tree: ${errorMessage(error)}`);
-					}
-				}
-			};
 			const abort = () => {
 				if (wasAborted) return;
 				wasAborted = true;
-				killTree("SIGTERM");
-				killTimer = setTimeout(() => {
-					killTree("SIGKILL");
-				}, 5000);
+				cancellationPending = true;
+				void stopProcessTree(child).catch((error: unknown) => {
+					cancellationError = error;
+				}).finally(() => {
+					cancellationPending = false;
+					finishClose();
+				});
 			};
 			if (request.signal?.aborted) abort();
 			else request.signal?.addEventListener("abort", abort, { once: true });
@@ -226,14 +299,19 @@ export async function runMuse(request: MuseRunRequest): Promise<MuseRunResult> {
 				stderr += `${stderr ? "\n" : ""}Failed to spawn muse: ${error.message}`;
 			});
 			child.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				if (killTimer) clearTimeout(killTimer);
+				closed = true;
+				closeCode = code ?? 1;
 				request.signal?.removeEventListener("abort", abort);
-				resolve(code ?? 1);
+				if (buffer.trim()) processLine(buffer);
+				finishClose();
 			});
 		});
 
-		if (wasAborted) throw new Error("Muse run was aborted");
+		if (wasAborted) {
+			throw new Error(cancellationError === undefined
+				? "Muse run was aborted"
+				: `Muse abort requested; process-tree cleanup failed: ${errorMessage(cancellationError)}`);
+		}
 		const output = terminalOutput ?? streamedOutput;
 		const failed = Boolean(terminalError) || exitCode !== 0;
 		const failure = terminalError ?? (failed ? stderr.trim() || `Muse exited with code ${exitCode}` : undefined);

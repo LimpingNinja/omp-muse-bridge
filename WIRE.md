@@ -1,186 +1,200 @@
-# Muse Session Protocol (MSP): bridge wire notes
+# Muse Session Protocol: bridge wire notes
 
-Source: `muse schema generate-json-schema --out /tmp/msp-schema --experimental` (muse 1.0.2, build d57a141c, schema
-version 1, fingerprint `sha256:03312c213efd...`), plus probes against `muse serve` on 2026-09-04. This file records
-only what the bridge relies on. Regenerate the schema after a muse upgrade and re-check the tables below.
+Schema source: `muse schema generate-json-schema --out /tmp/msp-schema --experimental`, generated with Muse 1.0.2
+(build d57a141c, schema version 1, fingerprint `sha256:03312c213efd...`). Host observations below came from Muse
+1.0.2/1.0.3 probes on 2026-09-04. They are version-specific observations, not additional protocol guarantees.
+Regenerate the schema and repeat the relevant probes after upgrading Muse.
 
-## Transport
+## Transport and handshake
 
-- `muse serve` is a stdio session host. Framing is newline-delimited JSON-RPC 2.0 (ndjson, no `Content-Length`
-  headers).
-- The client owns stdin/stdout; that pipe is the host's only connection.
-- Sandbox posture is fixed at spawn time by flags. Approval mode is chosen on the wire, not by a flag.
-- Requests may carry `trace` (W3C passthrough). `params` is omitted rather than `null` when empty. Results are always
-  objects.
-- RequestId is an integer or a string, and `1` is not the same id as `"1"`.
+`muse serve` is a stdio host using newline-delimited JSON-RPC 2.0, without `Content-Length` headers. The client owns
+stdin/stdout. `PI_MUSE_BINARY` selects the executable for both this host and the exec fallback.
 
-## Handshake
+The bridge sends `initialize {clientInfo:{name,title,version}}`, waits for its object result, then sends `initialized`.
+The schema also permits capability negotiation; the bridge does not request experimental capabilities. The initialize
+result describes the server, schema, granted capabilities, and session durability. Calls before initialization fail
+with `notInitialized`.
 
-1. Client sends `initialize {clientInfo{name,version}, capabilities{experimentalApi, requestedCapabilities[],
-   optOutNotificationMethods[]}}`.
-2. Server replies `{serverInfo, userAgent, museHome, platformFamily/Os, schema{version,fingerprint},
-   grantedCapabilities[], experimentalApi, sessionDurability}`.
-3. Client sends the `initialized` notification. It is accepted silently; the server also lists it in its own
-   notification table.
-4. Every other method fails with `ErrorKind.notInitialized` until `initialize` returns.
+Request IDs can be numbers or strings; `1` and `"1"` are distinct. Empty `params` must be an object or omitted, not null.
+The bridge narrows decoded envelopes before dispatch. Durable page entries are `{method,params}` records rather than
+complete JSON-RPC envelopes. Opaque cursors are compared by equality, never parsed as sequence numbers.
 
-## Idempotency
+Sandbox posture is fixed when the host spawns. Default flags are `--disable-sandbox --trust-workspace`; sandboxed mode
+uses `--trust-workspace`. Approval mode is chosen on the wire. A live host cannot change sandbox posture while a turn
+is active.
 
-Every command takes a `commandId` that the client mints as a UUIDv7; the server never mints one. `turnId` derives from
-the `turn/start` `commandId`, so a fresh turn has `turnId == commandId`. The bridge therefore carries its own uuidv7
-implementation (ms timestamp prefix, random tail, version 7, variant 10).
+## Commands and queries used
 
-## Methods used by this bridge
+Commands carry client-minted UUIDv7 `commandId` values. The observed host derives a fresh `turnId` from the `turn/start`
+command ID, so the bridge registers that ID before sending the request and can accept notifications preceding its ack.
 
-| Method | Required params | Result |
+| Method | Bridge request | Relevant result |
 |---|---|---|
-| `session/start` | `commandId`, `sessionId?` (client may choose it), `workspaceRoot`, `modelId?`, `providerId?`, `approvalMode?`, `config?` (reserved) | `{session, viewCursor}`, auto-subscribed |
-| `session/resume` | `commandId`, `sessionId`, `cursor?`, `history?` (auto/inline/snapshot/anchored), `excludeItems?` | `{session, viewCursor, history, pendingRequests[]}`, auto-subscribed |
-| `turn/start` | `commandId`, `sessionId`, `input: TurnInputPart[]` (non-empty), `displayText?`, `ifBusy?` (queue\|steer\|replace, default queue), `reasoningEffort?` | `{commandId, turnId, disposition (started\|queued\|steered), startedNewTurn, status:"accepted"}` |
-| `turn/steer` | `commandId`, `sessionId`, `expectedTurnId`, `input[]`, `reasoningEffort?` | `{commandId, turnId, status}`; `expectedTurnId` closes the race, a stale id errors so the caller can fall back |
-| `turn/interrupt` | `commandId`, `sessionId`, `turnId?`, `retract?` | `{commandId, turnId, status}` |
-| `turn/cancel`, `turn/unqueue` | `commandId`, `sessionId`, `turnId` (unqueue needs the exact queued `turnId` from the ack) | `{commandId, turnId, status}` |
-| `userInput/cancel` | `commandId`, `sessionId`, `userInputId`, `reason?` | settles the prompt; the model sees a cancelled result |
-| `approval/decide` | unused while approval mode is `allowAll` | n/a |
+| `session/start` | `commandId`, `sessionId`, `workspaceRoot`, `modelId`, `approvalMode:"allowAll"` | `{session,viewCursor}`; subscribes the host |
+| `session/resume` | `commandId`, `sessionId` | `{session,viewCursor,history,pendingRequests}`; subscribes the host |
+| `session/setModel` | `commandId`, `sessionId`, `model:{modelId}` | acceptance of the durable selection for subsequent model calls |
+| `turn/start` | `commandId`, `sessionId`, nonempty `input`, optional `reasoningEffort` | `{commandId,turnId,disposition,startedNewTurn,status}` |
+| `turn/steer` | `commandId`, `sessionId`, `expectedTurnId`, nonempty `input`, optional `reasoningEffort` | `{commandId,turnId,status}`; stale expected IDs are rejected |
+| `turn/interrupt` | `commandId`, `sessionId`, `turnId` | `{commandId,turnId,status}`; acceptance is not a termination proof |
+| `userInput/cancel` | `commandId`, `sessionId`, `userInputId`, `reason` | settles the question as cancelled |
+| `view/page` | `sessionId`, `direction:"forward"`, `limit:1000`, optional durable `cursor` | `{events,nextCursor,...}` |
 
-`TurnInputPart` is `{type:"text",text}` or `{type:"image",base64Data,mediaType,width?,height?}`.
+`model/list` is available for discovery probes but is not used for ordinary registration; registration reads Muse's
+local catalog. `turn/cancel`, `turn/unqueue`, and `approval/decide` exist in the schema but are not used by the bridge.
 
-`ApprovalMode` is a closed enum: `allowAll`, `promptUnmatched`, `onRequest`, `denyUnmatched`. Yolo parity is wire
-`approvalMode:"allowAll"` plus the spawn flags `--disable-sandbox --trust-workspace`. `"never"` is invalid and the
-probe returns `-32602 unknown variant`.
+The wire `ApprovalMode` values are `allowAll`, `promptUnmatched`, `onRequest`, and `denyUnmatched`. The CLI's `never`
+spelling is not a valid wire value. Unrestricted parity combines wire `allowAll` with the default host flags.
 
-`session/start` with a client-chosen `sessionId` creates a new root session with exactly that id; an existing session
-needs `session/resume`. Relevant errors: `sessionNotFound` (-32020), `sessionInUse`, `sessionNotLoaded`,
-`commandRejected`, `backpressured`.
+`TurnInputPart` is either `{type:"text",text}` or `{type:"image",base64Data,mediaType,width?,height?}`. Fresh bridge
+turns remain text-only and reject image attachments. Steering can pass image parts supplied by OMP. Question-answer
+image attachments are reserved/rejected by this schema version.
 
-## Notifications
+## Notifications and ownership
 
-Server to client, auto-subscribed after `session/start` or `session/resume`:
+The bridge consumes:
 
-`initialized`, `item/started` (full Item at revision 1), `item/delta {itemId, delta, field?}` where an absent `field`
-means the item `text` and concatenation in cursor order equals the field (dotted paths appear, for example
-`"summary.0"` and `"output"`), `item/updated` and `item/completed` (full Item at that revision or terminal),
-`turn/started {turnId, commandId, sessionId, viewCursor, sourceRange}`, `turn/completed {turnId, terminal:
-completed|failed|cancelled, error?{kind,message,retryable}, reason?, usage?: TokenUsage, durationMs?,
-timeToFirstTokenMs?}`, `turn/retracted`, `turn/retryScheduled`, `turn/unqueued`, `session/tokenUsage`,
-`session/contextUsage`, `session/modelChanged`, `session/approvalModeChanged`, `session/branchChanged`,
-`session/goalChanged`, `session/todoListChanged`, `userInput/requested {userInputId, turnId, toolCallId, toolName,
-itemId, questions[], autoResolutionMs?}`, `userInput/settled`, `approval/requested`, `approval/resolved`,
-`approval/updated`, and `view/gap {after, next, sessionId}`.
+- `turn/started` and `turn/completed`
+- `item/started`, `item/updated`, `item/completed`, and `item/delta`
+- `session/tokenUsage`, `session/contextUsage`, and `session/todoListChanged`
+- `view/gap` and `userInput/requested`
 
-Every notification carries `sessionId` and `viewCursor` (monotonic, opaque). View events also carry `sourceRange`.
+Session notifications are routed by `sessionId`. Items and usage are further scoped to the current turn and successors
+owned by that response stream; unrelated turns must not contribute text or acknowledge a steer.
 
-## Gap handling
+`item/delta {itemId,delta,field?}` appends to a tracked item. An absent/empty field is treated as `text`. Agent text feeds
+the response; `reasoning` fields named `summary.N` feed thinking. Raw tool/shell output deltas are not displayed.
+`item/completed` carries authoritative full item text, which replaces an incomplete streamed version.
 
-`view/page` serves the durable view: its own cursor namespace, and no `item/delta` records. The live `after` and `next`
-cursors from `view/gap` are therefore not valid page anchors, and dropped deltas cannot be recovered. On a gap the
-bridge keeps processing live events and pages the durable view from its start, applying only this turn's
-`item/completed` `agentMessage` text and `turn/completed`. Paging failure never fails a turn that is still streaming;
-it fails only when no live event has arrived since the gap. Cursors are opaque relay tokens, compared by string
-equality only. Gaps proved unprovokable under a 25 s stdout stall, because the host backpressures instead.
+Most session-view events carry `viewCursor`. `view/gap` instead carries `after`, `next`, and `sessionId`, without a
+`viewCursor`. `sourceRange` is optional durable provenance: ephemeral `item/delta` events and ephemeral item starts do
+not have it. Not every notification is a durable view event.
 
-An earlier design paged the live cursor namespace and spliced the hole into the live stream. It cannot work: the
-durable view has different cursors, so that path is gone.
+Known item kinds include `userMessage`, `agentMessage`, `reasoning`, `toolCall`, `userShell`, `subagent`, `workflow`,
+`reminderChild`, and `compaction`. Unknown non-answer kinds get a generic activity label. The bridge distinguishes
+`inProgress` from terminal statuses such as `completed`, `failed`, `cancelled`, `rejected`, and `timedOut`.
 
-## Item kinds
+## Gap recovery
 
-`userMessage`, `agentMessage`, `reasoning`, `toolCall`, `userShell`, `subagent`, `workflow`, `reminderChild`,
-`compaction`. The enum is open, so unknown kinds render generically.
+Observed `view/page` results contain the durable view, with a separate cursor namespace and no dropped live deltas.
+The live `after`/`next` values in a gap are not durable page anchors.
 
-Status is `inProgress`, `completed`, `failed`, `cancelled`, `rejected`, or `timedOut`; anything other than
-`inProgress` is terminal.
+On a gap, live delivery continues immediately. Recovery pages from the durable beginning and applies owned completed
+agent messages and relevant terminals. It has a 15-second deadline, at most 50 pages per attempt, and at most three
+attempts with two-second retry delays. Another gap arriving during recovery causes another catch-up pass afterwards.
+A page error fails the turn only if no live event has arrived since the gap; otherwise it is diagnostic.
 
-The bridge consumes `agentMessage` (the `text` field feeds the stream), `reasoning` (`summary.N` deltas, ignorable),
-and `toolCall` (progress diagnostics only). Item fields it reads: `itemId`, `kind`, `status`, `text`, `args`, `tool`,
-`callId`, `turnId`, `usage`, `visibleOutput`, `outputRef`, `truncated`.
+A live terminal can resolve the run's terminal promise while recovery is pending. The outcome builder still drains
+recovery before reading final text and publishing the response. Cancellation can stop waiting for recovery. The final
+text concatenates each owned agent item's authoritative text, or its streamed text when no completion was recovered;
+items are kept in their observed order without invented separator text.
 
-## TokenUsage
+A successful page with no terminal is not proof the turn ended. There is no overall execution timeout. Missing deltas
+cannot be reconstructed, and a failed recovery may leave partial text; diagnostics must not promise a recovered answer.
+A 25-second stdout-stall probe did not produce a gap: that host backpressured instead. Gap regressions therefore use
+controlled host fixtures as well as ordinary live-turn smoke checks.
 
-`inputTokens`, `outputTokens`, `cachedTokens`, and `reasoningTokens` are required. `cacheReadTokens` and
-`cacheWriteTokens` are optional and provider-dependent.
+## Usage and context occupancy
 
-## ErrorObject
+`TokenUsage` contains raw `inputTokens`, `outputTokens`, `cachedTokens`, and `reasoningTokens`, plus optional
+`cacheReadTokens` and `cacheWriteTokens`. Whether cached tokens are inside raw input is provider-dependent.
 
-`{code, message, data{kind: ErrorKind, ...}}`. The bridge branches on `data.kind` only. Notable kinds:
-`notInitialized`, `invalidParams`, `sessionNotFound`, `sessionInUse`, `sessionNotLoaded`, `commandRejected`,
-`backpressured`, the `turnNotFound` family via `notFound`, `userInputAlreadySettled`, `approvalAlreadyResolved`,
-`overloaded` (retryable), `interrupted`, `cancelled`. The `message` string is never a branch point.
+`session/tokenUsage` supplies one report per model completion:
 
-## Reserved and experimental surface
+- `promptTokens` and `totalTokens` are server-derived, counted-once values.
+- `usage` contains raw provider counters; `cumulative` contains session-lifetime accounting, not context occupancy.
+- OMP uncached input is `max(0, promptTokens - cacheReadTokens - cacheWriteTokens)`. The bridge sums the server total
+  directly, without adding cache tokens again or separately adding reasoning tokens.
+- If counted-once fields are absent, the bridge preserves raw input and uses a best-effort component sum. This cannot
+  establish the provider's cache-overlap convention and is not equivalent to canonical accounting.
 
-- `workflow/*` methods are specified but not served; they have no row in the bundle.
-- Error codes -32060 to -32069 are reserved (they appear in the raw log, but v1 never emits them). -32012 is never
-  assigned.
-- The only grantable capability is `userShell`.
-- `--experimental` is needed only for experimental surface. The stable surface covers everything the bridge uses.
+`session/contextUsage.usedTokens` replaces the latest measured occupancy, including zero. Absence is distinct from a
+measured zero. The provider passes a measured value to OMP's `contextSnapshot`; it never substitutes cumulative usage.
 
-## Probe results
+Exec records are normalized separately: absent counters retain the last report, explicit zero counters replace it,
+and reported totals take precedence over derived totals. Records with no accounting fields do not replace a canonical
+total. Pricing is estimated through OMP's catalog pricing API; absent Muse prices produce zero estimates, not a claim
+of free service.
 
-- The init handshake and `model/list` work over ndjson. The model list includes `muse-spark-1.3` with a context limit
-  of 1,007,997 and an output limit of 128,000; that differs from the exec `/v1` alias, which reports 262k.
-- `session/start` rejects `approvalMode:"never"`; the yolo value is `allowAll`. A full turn ran green with it:
-  `session/start` (the bridge-minted uuid is kept verbatim), `turn/start` (`turnId == commandId`,
-  `disposition:"started"`), `item/started` and `item/delta` (`field:"text"` is sent explicitly, and an absent field
-  also means text), `item/completed` (authoritative `item.text`), `session/tokenUsage`, then `turn/completed` with
-  `usage: null`, `durationMs` 2024, and `timeToFirstTokenMs` 1932. Usage arrives through the `session/tokenUsage`
-  notification.
-- `session/started` fires on start. The `viewCursor` format is `v:<sessionId>:<ordinal>` and is treated as opaque.
-- A host turn takes about 2 s where `muse exec` takes 9 to 14 s.
-- Any `session/...` call before a start returns `-32020 sessionNotFound`; the host tracks its loaded set, and the
-  durable store is shared with exec.
+## Session continuity and admission
 
-## Bridge design
+The OMP session owns a bridge-minted Muse session ID, never the OMP ID itself. The provider's in-memory state records
+that owner and request occupancy. The durable map at `<agentDir>/omp-muse-bridge-sessions.json` records the backend ID,
+initialization state, semantic context checkpoint, instruction/workspace fingerprint, and update time.
 
-Turn path:
+Store writes use the SDK's cross-process lock and atomic private-file replacement. Legacy string-ID mappings remain
+readable but have no checkpoint, so they are re-seeded. Corrupt stores are reported without overwriting them. Pruning
+retains the 200 most recently updated mappings; it does not delete Muse's own session history.
 
-- A persistent `muse serve` host backs `streamSimple`. It is spawned lazily with `--disable-sandbox
-  --trust-workspace`, and the wire approval mode is `allowAll`.
-- Muse session ids are bridge-minted uuidv7 values, never the OMP session id, and the `OMP id -> Muse id` pairs are
-  persisted in `<agentDir>/omp-muse-bridge-sessions.json` so a restart reattaches the same Muse session.
-- A session this bridge creates receives an initial prompt: OMP's system prompt with tool documentation stripped, the
-  post-compaction context window, and the task. A resumed session gets the bare task.
-- Deltas come from `item/delta` on `agentMessage` with `field:"text"`. Authoritative text comes from
-  `item/completed`, and the terminal comes from `turn/completed`: completed maps to stop, failed to error, cancelled
-  to aborted.
-- An `options.signal` abort sends `turn/interrupt`, and the run settles itself as cancelled after a 3 s grace so it
-  cannot outlive the user's ESC.
-- Spawn, handshake, or open failure falls back to `muse exec` with a visible degraded warning. A host death mid-run
-  puts the error in the outcome, marks the host dead, and respawns on the next call.
+Before a turn, the provider compares owner and committed context. A fork gets its own backend without closing the
+parent's state. Changed instructions, workspace, tree history, compaction, another provider's work, or a missing
+checkpoint require a fresh backend. A checkpoint is cleared before admission and committed only after success.
 
-Steering:
+A fresh backend receives the complete seed once: OMP instructions without tool documentation, a 40,000-character
+history budget that reserves the latest compaction summary first, bounded tool details, and the task. The seed is
+built lazily only when needed. Matching resumed sessions receive the current task, not the seed again. Fresh exec
+fallbacks follow the same seeding rule.
 
-- A module-level active-run registry is keyed by Muse session id.
-- `pi.on("input")` first requires `ctx.model?.provider === "muse-code"`. The hook sees every interactive message, and
-  without that gate a stale run swallowed input aimed at other providers.
-- A run is steerable only while it owns a live turn: not settled, no terminal resolved, not interrupted, and not
-  parked in the successor hold (`heldTerminal`).
-- A landed steer returns `{handled:true}` and persists a `muse-steer` custom message rendered with its line breaks
-  intact. A refused steer falls through to a normal turn.
-- A single boolean tracks the unanswered steer. A counter drifted when steers were queued, rejected, or coalesced,
-  and it re-armed the hold forever.
-- `userInput/requested` is answered with an automatic `userInput/cancel`, matching exec behavior.
+An empty open result `viewCursor` raises `MuseSessionUnusableError`. That subtype survives the pre-admission catch so
+the provider can mint and seed one replacement instead of entering exec fallback. Spawn, handshake, and other open
+failures may raise `HostUnavailableError` and select exec. Once any `turn/start` request has been sent, admission is
+potentially effective: an error or missing acknowledgement does not permit fallback and duplicate execution.
 
-Progress reporting:
+Request ownership is released before a done/error event is published. A late continuation from that completed request
+must not clear a subsequent request's busy state.
 
-- Every non-answer item is reported as Markdown on the thinking channel with a `[Muse]` tag, the tool name and target
-  in inline code, and a status glyph.
-- Raw `visibleOutput` is never surfaced, so file contents and directory listings stay out of the transcript. Only a
-  failure reason or a self-reported change stat is shown.
-- Web tools report the query plus hostnames parsed with `new URL(...).hostname`.
-- Todo calls are hidden from the activity lines and delivered to the provider as a structured snapshot, which renders
-  as a themed panel through `registerAssistantThinkingRenderer`. OMP exposes no todo-write API to extensions, so the
-  panel is display-only.
+## Steering and cancellation
 
-## Host behavior the bridge works around
+OMP's input hook requires interactive input and an active `muse-code` model. Slash commands and explicit queue markers
+are left to OMP. A run refuses steering once interrupted, settled, terminal, or held waiting for a successor. A refused
+or rejected steer falls through to OMP rather than disappearing.
 
-- `session/start` on an id the durable store already holds is rejected as `commandRejected: "already exists or is
-  reserved"` on muse 1.0.3; older builds used `sessionInUse` or `invalidParams`. The bridge treats all of those as
-  "resume instead".
-- A resumed session can be unobservable: `session/resume` may return an empty `viewCursor` and then stream zero
-  notifications while the turn runs and completes durably. The bridge refuses such a session before admission
-  (`MuseSessionUnusableError`), mints a replacement, and re-seeds context.
-- `session/read` reports the stored record. Mid-flight it shows no active turn, so it is useless as a liveness gate
-  for steering; run-local state is authoritative there.
-- `turn/steer` is not a mid-generation interrupt. It is an inbox item drained at the next model-call boundary. A pure
-  monologue answers in a successor run with its own `turnId` (`user_successor.run_origin: pure_followup`), which the
-  bridge adopts so the steered answer reaches the same `streamSimple` call.
+A pending-steer record is installed before waiting for its acknowledgement. Acknowledgements and notifications from
+the same stdout chunk are reconciled, including consumed steered user messages. A rejected request must not clear a
+previously accepted, unanswered steer. An accepted-answer boolean is separate from pending requests, so rejected or
+coalesced requests do not create an unbounded counter.
+
+A completed parent with an unanswered steer is held for at most five seconds. A successor `turn/started` is adopted
+into that response stream. If none arrives, the bridge releases the held terminal with a diagnostic that the steer
+was not answered. `turn/steer` is an inbox operation, not a guaranteed interruption of the current model call.
+
+Abortable pre-admission waits return locally without sending a turn. After `turn/start` is sent, cancellation requests
+`turn/interrupt`; a subsequently adopted successor receives its own interrupt. A host `cancelled` terminal confirms
+cancellation. If no terminal arrives within three seconds, local settlement sets `aborted` but not
+`backendInterrupted`. Local settlement does not prove that Muse or its tools stopped, and the error states that
+termination was unconfirmed.
+
+Exec uses a detached process group on POSIX. Cancellation sends `SIGTERM`, waits up to five seconds, escalates to
+`SIGKILL`, and waits for group termination even if the leader already exited. `EPERM` from a liveness probe is treated
+as possible continued existence, never as proof of termination. Windows uses `taskkill /t /f`; that path has not been
+runtime-verified on the macOS development host.
+
+## Activity, plans, and questions
+
+Activity is Markdown thinking text with a `[Muse]` tag, tool/target labels, and outcomes. Raw `visibleOutput` is not
+quoted. Extraction permits bounded statistic syntax, failure reasons, and up to five distinct referenced web hostnames.
+Model-authored fallback descriptions are bounded separately. Hostnames identify references, not proof of visits.
+
+Todo calls themselves are hidden. Only validated committed `session/todoListChanged` snapshots replace the plan;
+`items:[]` clears it. The provider uses a session-owned live widget and persists an immutable custom-message snapshot
+at turn end. Message details restore that snapshot on reload/tree navigation. Snapshots are excluded from model context.
+This is display-only, not OMP's native todo state: the public extension API has no native todo writer.
+
+`userInput/requested` is currently cancelled automatically even in interactive OMP. MSP has `userInput/answer`,
+`userInput/cancel`, and `userInput/clarify`, and the current OMP SDK has an optional `askDialog` API. An interactive
+adapter is feasible but is not implemented; it must preserve session ownership and handle late or already-settled
+prompts. Headless cancellation must remain defined.
+
+## Error handling and observed host quirks
+
+RPC errors are `{code,message,data:{kind,...}}`. Most recovery branches use `data.kind`. One explicit compatibility
+exception also examines message text: Muse 1.0.3 reported an existing/reserved session as `commandRejected` with
+`already exists or is reserved`. The bridge resumes for that combination or for `sessionInUse`. It does not treat
+arbitrary `invalidParams` errors as permission to resume.
+
+The observed host could open a durable session with an empty view cursor and then complete work without live
+notifications. The empty-cursor guard prevents admission to that unobservable session.
+
+`session/read` returned stored state without an active turn during observed live runs. Do not use it as a steering
+liveness gate merely because its schema contains `activeTurnId`; bridge-owned run state is authoritative for that gate.
+There are no `session/status` or `session/reset` methods. A future bridge reset must refuse active ownership and clear
+both its in-memory state and durable mapping; it must not claim to delete Muse history.

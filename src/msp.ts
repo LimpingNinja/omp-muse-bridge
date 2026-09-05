@@ -1,25 +1,20 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import { errorMessage } from "./utils.ts";
 import { museThinkingLevel, type MuseThinkingLevel, type MuseUsage } from "./contracts.ts";
 import { resolveMuseModelId } from "./catalog.ts";
 
-// Muse Session Protocol (MSP) client: ndjson JSON-RPC 2.0 over `muse serve` stdio.
-// Wire notes: ../WIRE.md. Tier 1 = persistent host under streamSimple; tier 2 = active-run steer registry.
+/** Muse Session Protocol client over newline-delimited JSON-RPC stdio. */
 
-const HOST_CLIENT_INFO = { name: "omp_muse_bridge", title: "OMP omp-muse-bridge", version: "0.4.0" };
+const HOST_CLIENT_INFO = { name: "omp_muse_bridge", title: "OMP omp-muse-bridge", version: "0.4.5" };
 
-/** Observed muse 1.0.2: a steer that lands after the turn's last model call is answered by a successor run whose
- * `turn/started` follows the steered turn's `turn/completed` by ~50 ms (msdv_B1/B4b). Bound the wait for it. */
+/** The host answers a late steer in a successor run: bound the wait for its `turn/started`. */
 const SUCCESSOR_GRACE_MS = 5_000;
 
 /** Grace after a user abort before the run settles itself as cancelled, regardless of host terminals. */
 const ABORT_SETTLE_MS = 3_000;
 
-/**
- * Prefix for every bridge-authored activity line. Emitted as Markdown: OMP renders thinking content through its
- * Markdown pipeline, so bold/inline-code/lists/links/emoji all render (colour comes from the thinking theme, and
- * fenced code blocks are elided under `proseOnlyThinking` — hence inline code only).
- */
+/** Markdown activity prefix; inline formatting survives OMP's thinking display. */
 const MUSE_TAG = "**[Muse]**";
 
 export class HostUnavailableError extends Error {
@@ -29,11 +24,7 @@ export class HostUnavailableError extends Error {
 	}
 }
 
-/**
- * The host opened the session but will stream no view events for it (empty `viewCursor`, observed when muse 1.0.3
- * resumes a session an earlier host created). The turn has NOT started, so the caller can recover by opening a
- * different session — unlike `HostUnavailableError`, this says nothing about the host's health.
- */
+/** A session opened without an observable event stream; no turn has been admitted. */
 export class MuseSessionUnusableError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -59,7 +50,8 @@ export function uuidv7(): string {
 
 // --- wire-frame narrowing (RPC data is external input: check before read) ---
 
-type Frame = Record<string, unknown>;
+/** Raw ndjson frame: any JSON object on the wire. RPC data is external input: check before read. */
+export type Frame = Record<string, unknown>;
 
 function asRecord(value: unknown): Frame | undefined {
 	return value && typeof value === "object" && !Array.isArray(value) ? value as Frame : undefined;
@@ -71,6 +63,46 @@ function text(value: unknown): string {
 
 function numeric(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/** `session/todoListChanged` items: `text`/`status`, replace the whole list (an empty array is a cleared list). */
+export interface MuseTodoEntry {
+	label: string;
+	status: string;
+}
+
+/** Inbound ndjson envelope, narrowed before use. JSON-RPC ids may be strings or numbers. */
+interface InboundMessage extends Frame {
+	method: string;
+	params: Frame;
+}
+
+/** One page of the durable view, normalized from the external `view/page` result. */
+export interface DurablePage {
+	readonly events: readonly InboundMessage[];
+	readonly nextCursor: string | undefined;
+}
+
+/** Narrow a JSON-RPC notification before dispatching external data. */
+function inboundMessage(message: Frame): InboundMessage | undefined {
+	if (message.jsonrpc !== "2.0") return undefined;
+	const method = text(message.method);
+	if (!method) return undefined;
+	const rawParams = message.params;
+	if (rawParams !== undefined && !asRecord(rawParams)) return undefined;
+	return { ...message, method, params: asRecord(rawParams) ?? {} };
+}
+
+function durablePage(result: Frame): DurablePage {
+	if (!Array.isArray(result.events)) throw new Error("Muse durable page has no events array");
+	const events: InboundMessage[] = [];
+	for (const entry of result.events) {
+		const frame = asRecord(entry);
+		const method = frame ? text(frame.method) : "";
+		const params = frame ? asRecord(frame.params) : undefined;
+		if (method && params) events.push({ method, params });
+	}
+	return { events, nextCursor: text(result.nextCursor) || undefined };
 }
 
 interface RpcErrorInfo {
@@ -109,7 +141,7 @@ interface PendingRequest {
 
 class MuseHost {
 	private nextRequestId = 1;
-	private readonly pending = new Map<number, PendingRequest>();
+	private readonly pending = new Map<number | string, PendingRequest>();
 	private readonly listeners = new Set<(method: string, params: Frame) => void>();
 	private stdoutBuffer = "";
 	private readonly stderrTail: string[] = [];
@@ -132,6 +164,15 @@ class MuseHost {
 			this.pending.clear();
 			reject(new Error(detail));
 		});
+		child.once("error", (error) => {
+			this.exited = true;
+			for (const waiter of this.pending.values()) {
+				clearTimeout(waiter.timer);
+				waiter.reject(error);
+			}
+			this.pending.clear();
+			reject(error);
+		});
 		child.stdout?.setEncoding("utf8");
 		child.stdout?.on("data", (chunk: string) => this.consumeStdout(chunk));
 		child.stderr?.setEncoding("utf8");
@@ -148,7 +189,7 @@ class MuseHost {
 		const args = sandboxed ? ["serve", "--trust-workspace"] : ["serve", "--disable-sandbox", "--trust-workspace"];
 		let child: ChildProcess;
 		try {
-			child = spawn("muse", args, { stdio: ["pipe", "pipe", "pipe"] });
+			child = spawn(process.env.PI_MUSE_BINARY?.trim() || "muse", args, { stdio: ["pipe", "pipe", "pipe"] });
 		} catch (error) {
 			throw new HostUnavailableError(`failed to spawn muse serve: ${errorMessage(error)}`, error);
 		}
@@ -171,30 +212,32 @@ class MuseHost {
 			const line = this.stdoutBuffer.slice(0, newline).trim();
 			this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
 			if (!line) continue;
-			let message: Frame;
+			let decoded: unknown;
 			try {
-				message = JSON.parse(line) as Frame;
+				decoded = JSON.parse(line);
 			} catch {
 				continue;
 			}
-			const id = typeof message.id === "number" ? message.id : undefined;
-			if (id !== undefined) {
-				const waiter = this.pending.get(id);
+			const message = asRecord(decoded);
+			if (!message) continue;
+			if (message.jsonrpc !== "2.0") continue;
+			const key = typeof message.id === "number" || typeof message.id === "string" ? message.id : undefined;
+			if (message.method === undefined && key !== undefined) {
+				const waiter = this.pending.get(key);
 				if (waiter) {
-					this.pending.delete(id);
+					this.pending.delete(key);
 					clearTimeout(waiter.timer);
 					const errorInfo = asRecord(message.error);
 					if (errorInfo) waiter.reject(new MspRequestError(waiter.method, rpcErrorInfo(errorInfo) ?? { message: "unknown error" }));
 					else waiter.resolve(asRecord(message.result) ?? {});
-					continue;
 				}
+				continue;
 			}
-			const method = text(message.method);
-			if (!method) continue;
-			const params = asRecord(message.params) ?? {};
+			const inbound = inboundMessage(message);
+			if (!inbound) continue;
 			for (const listener of [...this.listeners]) {
 				try {
-					listener(method, params);
+					listener(inbound.method, inbound.params);
 				} catch {
 					// listener faults never break the wire
 				}
@@ -247,16 +290,13 @@ class MuseHost {
 }
 
 // ---------------------------------------------------------------------------
-// Host management + tier-2 run registry
+// Host management and active-run registry
 
 let hostPromise: Promise<MuseHost> | null = null;
-/** One entry of Muse's todo snapshot, normalized for callers that render it themselves. */
-export interface MuseTodoEntry {
-	label: string;
-	status: string;
-}
 
 let activeHost: MuseHost | null = null;
+/** Sandbox posture of the live host: the host is shared, so reuse requires the identical spawn. */
+let activeHostSandboxed: boolean | undefined;
 const sessionsOnHost = new Map<string, MuseHost>();
 
 const sessionModelOnHost = new Map<string, string>();
@@ -270,45 +310,71 @@ interface TrackedItem {
 	turnId: string | undefined;
 	lastDeltaField?: string;
 	lastActivity?: string;
+	/** Authoritative completed text for a completed agentMessage; kept per item. */
+	finalText?: string;
+	partialText?: string;
+}
+
+/** Callbacks and ownership for one observed Muse run. */
+export interface TurnRunOptions {
+	host: MuseRequester;
+	sessionId: string;
+	thinkingLevel?: MuseThinkingLevel;
+	/** Agent text as it streams; `itemId` names the owning item when known. */
+	onTextDelta?: (delta: string, itemId?: string) => void;
+	onReasoningDelta?: (delta: string) => void;
+	onActivityDelta?: (delta: string) => void;
+	/** Canonical todo snapshot; replace the whole list, an empty array is a cleared list. */
+	onTodoSnapshot?: (entries: MuseTodoEntry[]) => void;
+	/**
+	 * Authoritative completed text of one agent item, including durable catch-up recovery. The consumer reconciles
+	 * that item's whole rendered text from it, so a late completion need not preserve corrupted streamed partials.
+	 */
+	onTextSnapshot?: (itemId: string, text: string) => void;
 }
 
 export class TurnRun {
 	/** Items this run streams: kind + owning turnId. Only items owned by `turnId` (or with no owner) are admitted. */
 	private readonly items = new Map<string, TrackedItem>();
 	turnId: string | undefined;
-	private lastAgentText = "";
-	private settled = false;
-	private usage: Frame | undefined;
+	private usage: MuseUsage | undefined;
 	private interrupted = false;
 	private terminalResolved = false;
-	private catchingUp = false;
+	private catchUpTask: Promise<void> | undefined;
+	private gapRevision = 0;
+	private readonly stopped = new AbortController();
+	private readonly ownedTurnIds = new Set<string>();
+	private readonly interruptedTurnIds = new Set<string>();
+	private readonly pendingSteers = new Map<string, { answered: boolean }>();
 	/** Set by view/gap; cleared by the first live event after it. Decides whether a failed catch-up may fail the turn. */
 	private gapAwaitingLive = false;
 	private readonly terminalResolvers: { resolve: (v: TurnTerminal) => void };
 	readonly terminal: Promise<TurnTerminal>;
 	readonly diagnostics: string[] = [];
-	/**
-	 * True between an acked `turn/steer` and the `userMessage{steered:true}` that answers it. A boolean cannot drift
-	 * the way a counter does when steers are queued, rejected, or coalesced by the host — a stuck count would re-arm
-	 * the successor hold on every terminal and keep the run registered after the turn is really over.
-	 */
+	/** An accepted steer not yet consumed by a model call. */
 	private awaitingSteeredAnswer = false;
 	/** This turn's `completed` terminal, parked while a successor run is expected for an outstanding steer. */
 	private heldTerminal: TurnTerminal | undefined;
 	private successorTimer: ReturnType<typeof setTimeout> | undefined;
 	private abortTimer: ReturnType<typeof setTimeout> | undefined;
 	private reasoningEffort: string | undefined;
+	private readonly host: MuseRequester;
+	readonly sessionId: string;
+	private readonly onTextDelta?: (delta: string, itemId?: string) => void;
+	private readonly onReasoningDelta?: (delta: string) => void;
+	private readonly onActivityDelta?: (delta: string) => void;
+	private readonly onTodoSnapshot?: (entries: MuseTodoEntry[]) => void;
+	private readonly onTextSnapshot?: (itemId: string, text: string) => void;
 
-	constructor(
-		private readonly host: MuseRequester,
-		readonly sessionId: string,
-		private readonly onTextDelta?: (delta: string) => void,
-		private readonly onReasoningDelta?: (delta: string) => void,
-		private readonly onActivityDelta?: (delta: string) => void,
-		thinkingLevel?: MuseThinkingLevel,
-		private readonly onTodoSnapshot?: (entries: MuseTodoEntry[]) => void,
-	) {
-		this.reasoningEffort = museThinkingLevel(thinkingLevel);
+	constructor(options: TurnRunOptions) {
+		this.host = options.host;
+		this.sessionId = options.sessionId;
+		this.onTextDelta = options.onTextDelta;
+		this.onReasoningDelta = options.onReasoningDelta;
+		this.onActivityDelta = options.onActivityDelta;
+		this.onTodoSnapshot = options.onTodoSnapshot;
+		this.onTextSnapshot = options.onTextSnapshot;
+		this.reasoningEffort = museThinkingLevel(options.thinkingLevel);
 		const { promise, resolve } = Promise.withResolvers<TurnTerminal>();
 		this.terminal = promise;
 		this.terminalResolvers = { resolve };
@@ -316,10 +382,12 @@ export class TurnRun {
 
 	/** Live-path entry. Every live event is processed immediately; a view gap only starts a durable catch-up. */
 	handleNotification(method: string, params: Frame): void {
-		if (this.settled) return;
+		if (this.settledFlag) return;
 		if (method !== "view/gap") this.gapAwaitingLive = false;
 		this.process(method, params);
 	}
+
+	private settledFlag = false;
 
 	/** Parsed tool arguments, or undefined when the model emitted non-JSON (the wire keeps `args` verbatim). */
 	private static toolArgs(args: string): Frame | undefined {
@@ -330,7 +398,7 @@ export class TurnRun {
 		}
 	}
 
-	/** Most informative argument for a tool call, by the field names Muse's tools actually use. */
+	/** Select a compact target from the tool's arguments. */
 	private static primaryArgument(record: Frame | undefined): string {
 		if (!record) return "";
 		for (const key of ["description", "path", "file_path", "filePath", "target_file", "query", "url", "pattern", "glob", "command", "objective", "prompt"]) {
@@ -340,27 +408,21 @@ export class TurnRun {
 				return flat.length > 120 ? `${flat.slice(0, 119)}…` : flat;
 			}
 		}
-		if (Array.isArray(record.todos)) return `${record.todos.length} item${record.todos.length === 1 ? "" : "s"}`;
 		return "";
 	}
 
-	/**
-	 * Muse's todo list rendered as readable lines, so a plan update is visible instead of an opaque tool call.
-	 * Muse spells the collection `todos` or `items`, and the entry label `text` (also seen: content/title/task).
-	 */
-	private static todoEntries(record: Frame | undefined): MuseTodoEntry[] {
-		if (!record) return [];
-		const raw = Array.isArray(record.todos) ? record.todos : Array.isArray(record.items) ? record.items : undefined;
-		if (!raw) return [];
+	/** Decode a committed snapshot; malformed events must not clear the displayed plan. */
+	private static todoEntries(record: Frame | undefined): MuseTodoEntry[] | undefined {
+		if (!record || !Array.isArray(record.items)) return undefined;
 		const parsed: MuseTodoEntry[] = [];
-		for (const entry of raw.slice(0, 20)) {
+		for (const entry of record.items) {
 			const todo = asRecord(entry);
-			if (!todo) continue;
-			const label = (text(todo.text) || text(todo.content) || text(todo.title) || text(todo.task)).replace(/\s+/g, " ").trim();
-			if (!label) continue;
+			if (!todo || typeof todo.text !== "string" || typeof todo.status !== "string") return undefined;
+			const label = todo.text.trim();
+			if (!label) return undefined;
 			parsed.push({
-				label: label.length > 100 ? `${label.slice(0, 99)}…` : label,
-				status: text(todo.status) || text(todo.state) || "pending",
+				label,
+				status: text(todo.status) || "pending",
 			});
 		}
 		return parsed;
@@ -375,25 +437,20 @@ export class TurnRun {
 		}).join("\n");
 	}
 
-	/**
-	 * Terminal-state detail. Deliberately NOT the tool's raw `visibleOutput` — that is file contents, listings and
-	 * command output the transcript is meant to stay free of. Only a failure reason, or a change summary the tool
-	 * itself stated in a recognizable form (e.g. `+12 -5`, `3 insertions`), is surfaced.
-	 */
+	/** Extract only failure reasons or bounded change-stat syntax, never arbitrary tool-output spans. */
 	private static resultSummary(item: Frame): string {
 		const failure = text(item.failureReason).replace(/\s+/g, " ").trim();
 		if (failure) return failure.length > 160 ? `${failure.slice(0, 159)}…` : failure;
 		const output = text(item.visibleOutput);
-		const stats = /([+-]\d+\s+[+-]\d+)|(\d+\s+insertions?[^,]*,\s*\d+\s+deletions?)|(\d+\s+lines?\s+(?:added|removed|changed))/i.exec(output);
+		const stats = /(?<![\w+-])(?:[+-]\d{1,9}[ \t]{1,8}[+-]\d{1,9}|\d{1,9}[ \t]{1,8}insertions?(?:\(\+\))?,[ \t]{0,8}\d{1,9}[ \t]{1,8}deletions?(?:\(-\))?|\d{1,9}[ \t]{1,8}lines?[ \t]{1,8}(?:added|removed|changed))(?![\w])/i.exec(output);
 		return stats ? stats[0].replace(/\s+/g, " ").trim() : "";
 	}
 
-	/** Hosts a web tool actually reached, so a search reports its sources without pasting page text. */
+	/** Distinct hostnames referenced by a web result, without including page contents. */
 	private static resultSites(item: Frame): string {
 		const hosts: string[] = [];
-		// The class stops where prose and Markdown put delimiters after a URL. A bare `\S+` captured
-		// `https://omp.sh)**`, and `new URL` keeps `)` and `*` in the host, so one site was reported twice under two
-		// spellings. Truncating a path early is harmless here: only the host is used.
+		// The class stops where prose and Markdown put delimiters after a URL: only the host is used, so truncating
+		// a path early is harmless.
 		for (const match of text(item.visibleOutput).matchAll(/https?:\/\/[^\s"'`<>()[\]{}*|\\]+/g)) {
 			let host = "";
 			try {
@@ -415,6 +472,8 @@ export class TurnRun {
 		const rawStatus = text(item.status);
 		const status = rawStatus === "inProgress" ? "started" : rawStatus || method.slice("item/".length);
 		const terminal = status !== "started";
+		// `fallbackText` is model-authored prose shown while the tool runs; `visibleOutput` is the raw tool payload
+		// and is never quoted.
 		const rawFallback = text(item.fallbackText).replace(/\s+/g, " ").trim();
 		const fallback = rawFallback.length > 200 ? `${rawFallback.slice(0, 199)}…` : rawFallback;
 		let message: string;
@@ -422,17 +481,10 @@ export class TurnRun {
 			const tool = text(item.tool) || "tool";
 			const args = TurnRun.toolArgs(text(item.args));
 			const target = TurnRun.primaryArgument(args);
-			// A todo update is a plan, not tool noise: the call itself is always hidden. Hand structured entries to a
-			// consumer that renders them (a themed panel); only inline the list when nobody consumes snapshots.
+			// A todo update is a plan, not tool noise: the call itself is always hidden. The authoritative list
+			// arrives as `session/todoListChanged`, so neither its start nor its args are surfaced here.
 			if (/todo/i.test(tool)) {
-				if (terminal) return;
-				const entries = TurnRun.todoEntries(args);
-				if (!entries.length) return;
-				if (this.onTodoSnapshot) {
-					this.onTodoSnapshot(entries);
-					return;
-				}
-				message = `${MUSE_TAG} plan\n${TurnRun.renderTodoLines(entries)}`;
+				return;
 			} else if (!terminal) {
 				message = /^web_search$/i.test(tool)
 					? `${MUSE_TAG} 🔎 searched ${target ? `\`${target}\`` : "(query unavailable)"}`
@@ -468,24 +520,27 @@ export class TurnRun {
 	}
 
 	private process(method: string, params: Frame): void {
-		if (this.settled) return;
+		if (this.settledFlag) return;
 		if (method === "view/gap") {
 			const after = text(params.after);
 			const next = text(params.next);
 			this.diagnostics.push(`Muse view stream dropped events between cursor ${after || "?"} and ${next || "?"}; streamed text may be incomplete, final text is authoritative`);
 			this.gapAwaitingLive = true;
-			void this.durableCatchUp(1);
+			this.gapRevision++;
+			this.startCatchUp();
 			return;
 		}
 		if (method === "turn/started") {
-			// Successor run (`user_successor.run_origin: pure_followup`): the host answers a steer that arrived after this
-			// turn's last model call in a fresh run with its own turnId. Adopt it — its deltas/text/terminal are this outcome's.
+			// A late steer may continue under a successor turn ID in the same response stream.
 			const startedTurnId = text(params.turnId);
 			if (this.heldTerminal && startedTurnId && startedTurnId !== this.turnId) {
+				if (this.turnId) this.ownedTurnIds.add(this.turnId);
 				clearTimeout(this.successorTimer);
 				this.successorTimer = undefined;
 				this.heldTerminal = undefined;
 				this.turnId = startedTurnId;
+				this.ownedTurnIds.add(startedTurnId);
+				if (this.interrupted) this.interruptCurrentTurn();
 			}
 			if (!startedTurnId || startedTurnId !== this.turnId) return;
 			this.onActivityDelta?.(`\n\n${MUSE_TAG} turn started\n`);
@@ -496,27 +551,35 @@ export class TurnRun {
 			const itemId = item ? text(item.itemId) : "";
 			const kind = item ? text(item.kind) : "";
 			if (!item || !itemId || !kind) return;
-			// The steered userMessage settles one outstanding steer whether it lands in this turn (B2) or the successor (B1).
-			if (method === "item/completed" && kind === "userMessage" && item.steered === true) this.awaitingSteeredAnswer = false;
+			// Only items belonging to this run may acknowledge its steering.
 			const existing = this.items.get(itemId);
 			const ownerTurnId = typeof item.turnId === "string" ? item.turnId : existing?.turnId;
-			if (this.turnId && ownerTurnId !== undefined && ownerTurnId !== this.turnId) return; // another turn's item: never streamed here
+			if (this.turnId && ownerTurnId !== undefined && ownerTurnId !== this.turnId && !this.ownedTurnIds.has(ownerTurnId)) return;
+			if (method === "item/completed" && kind === "userMessage" && item.steered === true) {
+				this.awaitingSteeredAnswer = false;
+				for (const pending of this.pendingSteers.values()) pending.answered = true;
+			}
 			const tracked = existing?.kind === kind ? existing : { kind, turnId: ownerTurnId };
 			tracked.kind = kind;
 			tracked.turnId = ownerTurnId;
 			this.items.set(itemId, tracked);
-			if (method === "item/completed" && kind === "agentMessage" && typeof item.text === "string") this.lastAgentText = item.text;
+			if (method === "item/completed" && kind === "agentMessage" && typeof item.text === "string") {
+				tracked.finalText = item.text;
+				this.onTextSnapshot?.(itemId, item.text);
+			}
 			this.emitItemProgress(method, item, tracked);
 			return;
 		}
 		if (method === "item/delta") {
-			const tracked = this.items.get(text(params.itemId));
+			const itemId = text(params.itemId);
+			const tracked = this.items.get(itemId);
 			if (!tracked) return; // unknown or foreign item: dropped
 			const field = typeof params.field === "string" && params.field ? params.field : "text";
 			const delta = text(params.delta);
 			if (!delta) return;
 			if (tracked.kind === "agentMessage" && field === "text") {
-				this.onTextDelta?.(delta);
+				tracked.partialText = (tracked.partialText ?? "") + delta;
+				this.onTextDelta?.(delta, itemId);
 			} else if (tracked.kind === "reasoning" && /^summary\.\d+$/.test(field)) {
 				if (tracked.lastDeltaField && tracked.lastDeltaField !== field) this.onReasoningDelta?.("\n\n");
 				tracked.lastDeltaField = field;
@@ -526,17 +589,42 @@ export class TurnRun {
 			// carry the signal, and raw tool output (e.g. a full directory listing) floods the transcript.
 			return;
 		}
-		if (method === "session/tokenUsage") {
-			const frame = asRecord(params.usage);
-			if (!frame) return;
-			if (!this.usage) {
-				this.usage = { ...frame };
+		if (method === "session/todoListChanged") {
+			// Canonical snapshot replaces the whole list; an empty `items` array is a cleared list, not a no-op.
+			const entries = TurnRun.todoEntries(params);
+			if (!entries) {
+				this.diagnostics.push("Muse sent a malformed todo snapshot; retaining the committed plan");
 				return;
 			}
-			// One frame per model call; a turn (and an adopted successor) may have several. Sum — never last-wins.
-			for (const key of ["inputTokens", "outputTokens", "cachedTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens"]) {
-				this.usage[key] = numeric(this.usage[key]) + numeric(frame[key]);
-			}
+			if (this.onTodoSnapshot) this.onTodoSnapshot(entries);
+			else if (entries.length) this.onActivityDelta?.(`\n\n${MUSE_TAG} plan\n${TurnRun.renderTodoLines(entries)}\n`);
+			return;
+		}
+		if (method === "session/contextUsage") {
+			if (typeof params.usedTokens !== "number" || !Number.isFinite(params.usedTokens) || params.usedTokens < 0) return;
+			this.usage ??= { ...EMPTY_USAGE };
+			this.usage.contextTokens = params.usedTokens;
+			return;
+		}
+		if (method === "session/tokenUsage") {
+			const owner = text(params.turnId);
+			if (owner && owner !== this.turnId && !this.ownedTurnIds.has(owner)) return;
+			const frame = asRecord(params.usage);
+			const prompt = typeof params.promptTokens === "number" && Number.isFinite(params.promptTokens) ? params.promptTokens : undefined;
+			const total = typeof params.totalTokens === "number" && Number.isFinite(params.totalTokens) ? params.totalTokens : undefined;
+			if (!frame && prompt === undefined && total === undefined) return;
+			this.usage ??= { ...EMPTY_USAGE };
+			const cacheReadTokens = numeric(frame?.cacheReadTokens ?? frame?.cachedTokens);
+			const cacheWriteTokens = numeric(frame?.cacheWriteTokens);
+			const rawInput = numeric(frame?.inputTokens);
+			const promptTokens = prompt ?? rawInput + cacheReadTokens + cacheWriteTokens;
+			const output = numeric(frame?.outputTokens);
+			this.usage.input += prompt === undefined ? rawInput : Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+			this.usage.output += output;
+			this.usage.cacheRead += cacheReadTokens;
+			this.usage.cacheWrite += cacheWriteTokens;
+			this.usage.totalTokens += total ?? promptTokens + output;
+			this.usage.turns += 1;
 			return;
 		}
 		if (method === "turn/completed") {
@@ -546,17 +634,17 @@ export class TurnRun {
 				terminal: text(params.terminal) || "failed",
 				errorText: error ? rpcErrorInfo(error)?.message : undefined,
 				interrupted: this.interrupted,
+				localAbort: false,
 			};
-			if (value.terminal === "completed" && this.awaitingSteeredAnswer && !this.interrupted) {
-				// An accepted steer is still unanswered: the host will mint a successor run. Park the terminal until it
-				// completes (adopted in the turn/started branch); resolve as-is if no successor appears in time.
+			if (value.terminal === "completed" && this.hasUnansweredSteer && !this.interrupted) {
+				// Preserve the response stream while a pending or accepted steer awaits its successor.
 				this.heldTerminal = value;
 				this.successorTimer = setTimeout(() => {
 					this.successorTimer = undefined;
 					const held = this.heldTerminal;
 					if (!held) return;
 					this.heldTerminal = undefined;
-					this.awaitingSteeredAnswer = false; // the hold is over; never re-arm it from stale state
+					this.awaitingSteeredAnswer = false;
 					this.diagnostics.push("Muse accepted a steer but started no successor run; the steered input was not answered in this turn");
 					this.resolveTerminal(held);
 				}, SUCCESSOR_GRACE_MS);
@@ -573,71 +661,88 @@ export class TurnRun {
 		this.terminalResolvers.resolve(value);
 	}
 
-	/**
-	 * Gap recovery against muse 1.0.2 as observed (msdv_E2/E3): `view/page` serves the DURABLE view — a renumbered
-	 * cursor namespace with no `item/delta` — so the live `after`/`next` cursors are not valid page anchors and dropped
-	 * deltas are unrecoverable by design. The only facts a hole can cost this run are its authoritative agentMessage
-	 * `item/completed` text and its `turn/completed`; both are durable. Page the durable view from its start and apply
-	 * exactly those two event kinds; `process()` scopes them to this turn. Live delivery has already resumed at `next`,
-	 * so a failed catch-up fails the turn only when no live event has arrived since the gap (the terminal may be in the
-	 * hole and unreachable) — never a turn that is demonstrably still streaming.
-	 */
-	private async durableCatchUp(attempt: number): Promise<void> {
-		if (this.catchingUp || this.terminalResolved || this.settled) return;
-		this.catchingUp = true;
-		try {
-			let cursor = "";
-			for (let page = 0; page < 50 && !this.terminalResolved; page++) {
-				const result = await this.host.request("view/page", { sessionId: this.sessionId, ...(cursor ? { cursor } : {}), direction: "forward", limit: 1000 }, 15_000);
-				const events = Array.isArray(result.events) ? result.events : [];
-				for (const element of events) {
-					const frame = asRecord(element);
-					const params = frame ? asRecord(frame.params) : undefined;
-					if (!frame || !params) continue;
-					const eventMethod = text(frame.method);
-					const isFinalText = eventMethod === "item/completed" && asRecord(params.item)?.kind === "agentMessage";
-					if (isFinalText || eventMethod === "turn/completed") this.process(eventMethod, params);
-					if (this.terminalResolved) break;
+	/** Retain a promise for recovery so terminal publication can await every recovered completion. */
+	private startCatchUp(): void {
+		if (this.catchUpTask || this.settledFlag) return;
+		const revision = this.gapRevision;
+		this.catchUpTask = this.durableCatchUp().finally(() => {
+			this.catchUpTask = undefined;
+			if (revision !== this.gapRevision && !this.settledFlag) this.startCatchUp();
+		});
+	}
+
+	/** Durable cursors are independent of live cursors; recover completed items from the beginning. */
+	private async durableCatchUp(): Promise<void> {
+		const deadline = Date.now() + 15_000;
+		let failure: unknown;
+		for (let attempt = 1; attempt <= 3 && !this.settledFlag; attempt++) {
+			try {
+				let cursor = "";
+				for (let page = 0; page < 50; page++) {
+					const timeout = deadline - Date.now();
+					if (timeout <= 0) throw new Error("Muse durable recovery exceeded its deadline");
+					const result = durablePage(await this.host.request("view/page", {
+						sessionId: this.sessionId, ...(cursor ? { cursor } : {}), direction: "forward", limit: 1000,
+					}, timeout));
+					if (this.settledFlag) return;
+					for (const event of result.events) {
+						if (event.method === "item/completed" && asRecord(event.params.item)?.kind === "agentMessage") {
+							this.process(event.method, event.params);
+						} else if (event.method === "turn/completed" && !this.terminalResolved) {
+							this.process(event.method, event.params);
+						}
+					}
+					if (!result.nextCursor || result.nextCursor === cursor) return;
+					cursor = result.nextCursor;
 				}
-				const nextCursor = text(result.nextCursor);
-				if (!nextCursor || nextCursor === cursor) break; // `null` = end of the durable view; equal = no progress
-				cursor = nextCursor;
+				throw new Error("Muse durable recovery exceeded its page limit");
+			} catch (error) {
+				failure = error;
+				if (this.settledFlag) return;
+				if (attempt === 3 || Date.now() + 2_000 >= deadline) break;
+				this.diagnostics.push(`Muse durable recovery attempt ${attempt} failed; retrying`);
+				try {
+					await delay(2_000, undefined, { signal: this.stopped.signal });
+				} catch {
+					return;
+				}
 			}
-		} catch (error) {
-			this.catchingUp = false;
-			if (this.terminalResolved || this.settled) return;
-			if (attempt < 3) {
-				this.diagnostics.push(`Muse durable catch-up attempt ${attempt} failed (${errorMessage(error)}); retrying`);
-				setTimeout(() => void this.durableCatchUp(attempt + 1), 2_000);
-				return;
-			}
-			if (this.gapAwaitingLive) {
-				this.resolveTerminal({ terminal: "failed", errorText: `Muse view gap replay failed (${errorMessage(error)}); turn state lost`, interrupted: false });
-			} else {
-				this.diagnostics.push(`Muse durable catch-up failed after ${attempt} attempts (${errorMessage(error)}); relying on live delivery`);
-			}
-			return;
 		}
-		this.catchingUp = false;
+		if (this.settledFlag) return;
+		const detail = `Muse durable recovery failed: ${errorMessage(failure)}`;
+		if (this.gapAwaitingLive && !this.terminalResolved) {
+			this.resolveTerminal({ terminal: "failed", errorText: detail, interrupted: false, localAbort: false });
+		} else {
+			this.diagnostics.push(`${detail}; continuing with live output`);
+		}
 	}
 
+	async drainCatchUp(): Promise<void> {
+		while (this.catchUpTask && !this.settledFlag) await this.catchUpTask;
+	}
+
+	/** Streamed agent text with each completed item's authoritative replacement applied. */
 	get finalText(): string {
-		return this.lastAgentText;
+		let result = "";
+		for (const tracked of this.items.values()) {
+			if (tracked.kind === "agentMessage") result += tracked.finalText ?? tracked.partialText ?? "";
+		}
+		return result;
 	}
 
-	get tokenUsage(): Frame | undefined {
+	get tokenUsage(): MuseUsage | undefined {
 		return this.usage;
 	}
 
-	/**
-	 * Steerable only while this run owns a turn that is demonstrably still going. `heldTerminal` is the key
-	 * addition: after a `completed` terminal the run stays registered for the successor grace, and steering in that
-	 * window is exactly how a message meant for a brand-new turn got swallowed. `session/read` is deliberately NOT
-	 * consulted — it reports the stored record, which shows no active turn mid-flight, so it would refuse every
-	 * legitimate steer.
-	 */
+	/** Steering is valid only while this run owns a live, uninterrupted turn. */
 	private get steerable(): boolean {
-		return !this.settled && !this.terminalResolved && !this.interrupted && !this.heldTerminal && this.turnId !== undefined;
+		return !this.settledFlag && !this.terminalResolved && !this.interrupted && !this.heldTerminal && this.turnId !== undefined;
+	}
+
+	private get hasUnansweredSteer(): boolean {
+		if (this.awaitingSteeredAnswer) return true;
+		for (const pending of this.pendingSteers.values()) if (!pending.answered) return true;
+		return false;
 	}
 
 	async steer(input: Frame[], expectedTurnId?: string, thinkingLevel?: MuseThinkingLevel): Promise<boolean> {
@@ -645,42 +750,58 @@ export class TurnRun {
 		const turnId = expectedTurnId ?? this.turnId;
 		if (!turnId) return false;
 		const reasoningEffort = museThinkingLevel(thinkingLevel) ?? this.reasoningEffort;
+		const commandId = uuidv7();
+		const pending = { answered: false };
+		this.pendingSteers.set(commandId, pending);
 		try {
 			await this.host.request("turn/steer", {
-				commandId: uuidv7(),
-				sessionId: this.sessionId,
-				expectedTurnId: turnId,
-				input,
+				commandId, sessionId: this.sessionId, expectedTurnId: turnId, input,
 				...(reasoningEffort ? { reasoningEffort } : {}),
 			}, 10_000);
+			if (!pending.answered) this.awaitingSteeredAnswer = true;
 			this.reasoningEffort = reasoningEffort;
-			// Boolean, not a counter: counters drift when steers are queued, rejected, or answered asymmetrically,
-			// and a stuck count re-arms the successor hold forever.
-			this.awaitingSteeredAnswer = true;
 			return true;
 		} catch (error) {
-			this.diagnostics.push(`Muse steer did not land (${errorMessage(error)}); input fell through to normal flow`);
+			this.diagnostics.push(`Muse steer failed (${errorMessage(error)}); input falls through to OMP`);
 			return false;
+		} finally {
+			this.pendingSteers.delete(commandId);
+			const held = this.heldTerminal;
+			if (held && !this.hasUnansweredSteer && !this.terminalResolved) {
+				this.heldTerminal = undefined;
+				clearTimeout(this.successorTimer);
+				this.successorTimer = undefined;
+				this.resolveTerminal(held);
+			}
 		}
+	}
+
+	private interruptCurrentTurn(): void {
+		const turnId = this.turnId;
+		if (!turnId || this.interruptedTurnIds.has(turnId) || this.settledFlag) return;
+		this.interruptedTurnIds.add(turnId);
+		void this.host.request("turn/interrupt", { commandId: uuidv7(), sessionId: this.sessionId, turnId }, 10_000)
+			.catch((error: unknown) => this.diagnostics.push(`Muse interruption was not acknowledged: ${errorMessage(error)}`));
 	}
 
 	markInterrupted(): void {
 		this.interrupted = true;
-		// After a user abort the run MUST stop depending on a matching terminal. With outstanding steers the host
-		// mints successor runs and `turnId` moves, so the interrupted turn's `turn/completed` can arrive under an id
-		// this run no longer owns — that is how an ESC left OMP "Working" while the host had already cancelled, and
-		// left the run in `activeRuns` so the next message was swallowed as a steer.
+		this.interruptCurrentTurn();
+		// Local settlement bounds UI waiting; it does not prove that the host stopped.
 		clearTimeout(this.abortTimer);
 		this.abortTimer = setTimeout(() => {
 			this.abortTimer = undefined;
-			if (this.settled || this.terminalResolved) return;
+			if (this.settledFlag || this.terminalResolved) return;
 			this.diagnostics.push("Muse did not report a terminal for the interrupted turn; settling it locally as cancelled");
-			this.resolveTerminal({ terminal: "cancelled", errorText: undefined, interrupted: true });
+			// localAbort: this run settled itself; it says nothing about what the backend ran.
+			this.resolveTerminal({ terminal: "cancelled", errorText: undefined, interrupted: true, localAbort: true });
 		}, ABORT_SETTLE_MS);
 	}
 
 	settle(): void {
-		this.settled = true;
+		this.settledFlag = true;
+		this.stopped.abort();
+		this.pendingSteers.clear();
 		this.awaitingSteeredAnswer = false;
 		clearTimeout(this.successorTimer);
 		this.successorTimer = undefined;
@@ -693,6 +814,8 @@ interface TurnTerminal {
 	terminal: string;
 	errorText?: string;
 	interrupted: boolean;
+	/** True when the run settled itself on the local abort timer, not from a host terminal. */
+	localAbort: boolean;
 }
 
 const activeRuns = new Map<string, TurnRun>();
@@ -711,15 +834,21 @@ function hostListener(method: string, params: Frame): void {
 }
 
 export async function ensureHost(sandboxed: boolean): Promise<MuseHost> {
-	if (activeHost && !activeHost.dead) return activeHost;
+	if (activeHost && !activeHost.dead && activeHostSandboxed === sandboxed) return activeHost;
+	if (activeHost && !activeHost.dead && activeHostSandboxed !== sandboxed) {
+		if (activeRuns.size) throw new Error("Cannot change Muse sandbox posture while a host turn is active");
+		shutdownHost();
+	}
 	if (!hostPromise) {
 		hostPromise = MuseHost.connect(sandboxed)
 			.then((host) => {
 				activeHost = host;
+				activeHostSandboxed = sandboxed;
 				host.onNotification(hostListener);
 				host.exitPromise.catch(() => {
 					if (activeHost === host) {
 						activeHost = null;
+						activeHostSandboxed = undefined;
 						hostPromise = null;
 						for (const [key, value] of [...sessionsOnHost]) if (value === host) {
 							sessionsOnHost.delete(key);
@@ -740,13 +869,15 @@ export async function ensureHost(sandboxed: boolean): Promise<MuseHost> {
 export function shutdownHost(): void {
 	const host = activeHost;
 	activeHost = null;
+	activeHostSandboxed = undefined;
 	hostPromise = null;
 	sessionsOnHost.clear();
+	sessionModelOnHost.clear();
 	activeRuns.clear();
 	host?.dispose();
 }
 
-/** Tier 2: route user input to whichever Muse turn is currently running in this process. */
+/** Route user input only to a live Muse run in this process. */
 export async function steerActiveMuseRuns(
 	textInput: string,
 	images?: Array<{ data?: string; mimeType?: string }>,
@@ -767,183 +898,195 @@ export async function steerActiveMuseRuns(
 }
 
 // ---------------------------------------------------------------------------
-// Tier 1: host-backed turn runner
+// Host-backed turn runner
 
 export interface MuseTurnArgs {
 	sessionId: string;
 	/** True when the session already exists (started or exec'd earlier) and must be resumed on this host. */
 	resumeExisting: boolean;
 	prompt: string;
-	/**
-	 * The entire first input (OMP system prompt sans tools + post-compaction context + task), used wholesale ONLY
-	 * when this call creates the Muse session. Resumed sessions carry their own history, so `prompt` is used as-is
-	 * and the task can never be sent twice.
-	 */
-	initialPrompt?: string;
+	/** Build the complete seed only when a new backend session needs it. */
+	initialPrompt?: () => string;
 	modelId: string;
 	workspace: string;
 	thinkingLevel?: MuseThinkingLevel;
 	sandboxed: boolean;
 	signal?: AbortSignal;
-	onTextDelta?: (delta: string) => void;
+	/** Agent text as it streams; `itemId` names the owning item when known. */
+	onTextDelta?: (delta: string, itemId?: string) => void;
 	onReasoningDelta?: (delta: string) => void;
 	onActivityDelta?: (delta: string) => void;
-	/** Latest Muse todo snapshot for this turn; the caller renders it (OMP has no todo-write API for extensions). */
+	/** Canonical todo snapshot; the caller renders it (OMP has no todo-write API for extensions). */
 	onTodoSnapshot?: (entries: MuseTodoEntry[]) => void;
+	/**
+	 * Authoritative completed text of one agent item, including durable catch-up. The caller reconciles that
+	 * item's rendered text from it, so a late authoritative completion need not preserve corrupted streamed
+	 * partials.
+	 */
+	onTextSnapshot?: (itemId: string, text: string) => void;
 }
 
 export interface MuseTurnOutcome {
+	/** Full agent transcript: every completed agent message of this turn, in arrival order. */
 	output: string;
 	usage: MuseUsage;
 	diagnostics: string[];
 	/** Set when the turn failed after admission. */
 	errorMessage?: string;
+	/** Set when the caller cancelled the turn (local decision; never implies the backend stopped). */
 	aborted?: boolean;
+	/** Set with `aborted` when a host terminal confirmed the cancellation (never when the run settled locally). */
+	backendInterrupted?: boolean;
 }
 
-const EMPTY_USAGE: MuseUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+const EMPTY_USAGE: MuseUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
 
-/** Outcome for a turn the caller cancelled before the host admitted it: nothing ran, nothing to fall back to. */
-function abortedBeforeAdmission(run: TurnRun): MuseTurnOutcome {
-	return { output: "", usage: { ...EMPTY_USAGE }, diagnostics: run.diagnostics, aborted: true, errorMessage: "Muse turn was interrupted" };
+function abortedBeforeAdmission(diagnostics: string[] = []): MuseTurnOutcome {
+	return { output: "", usage: { ...EMPTY_USAGE }, diagnostics, aborted: true, errorMessage: "Muse turn was interrupted before admission" };
 }
 
-function mapUsage(usage: Frame | undefined): MuseUsage {
-	if (!usage) return { ...EMPTY_USAGE };
-	return {
-		input: numeric(usage.inputTokens),
-		output: numeric(usage.outputTokens),
-		cacheRead: numeric(usage.cacheReadTokens) || numeric(usage.cachedTokens),
-		cacheWrite: numeric(usage.cacheWriteTokens),
-		cost: 0,
-		contextTokens: 0,
-		turns: 1,
-	};
+/** Cancel local waiting without abandoning the underlying request's rejection handler. */
+function abortable<T>(request: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return request;
+	return new Promise<T>((resolve, reject) => {
+		const abort = () => {
+			signal.removeEventListener("abort", abort);
+			reject(new Error("Muse request was interrupted"));
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		request.then(
+			(value) => { signal.removeEventListener("abort", abort); resolve(value); },
+			(error: unknown) => { signal.removeEventListener("abort", abort); reject(error); },
+		);
+		if (signal.aborted) abort();
+	});
 }
 
-/**
- * Run one turn on the persistent `muse serve` host.
- * Throws HostUnavailableError for anything that fails before the turn is admitted,
- * letting the caller fall back to the proven exec path; host failures after
- * admission return an outcome with errorMessage/aborted set.
- */
+/** Run a host turn; fallback is allowed only when no turn/start request has been sent. */
 export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> {
-	const host = await ensureHost(args.sandboxed);
-	const run = new TurnRun(host, args.sessionId, args.onTextDelta, args.onReasoningDelta, args.onActivityDelta, args.thinkingLevel, args.onTodoSnapshot);
-	let admitted = false;
-
-	const abortHandler = () => {
-		run.markInterrupted();
-		host.request(
-			"turn/interrupt",
-			{ commandId: uuidv7(), sessionId: args.sessionId, ...(run.turnId ? { turnId: run.turnId } : {}) },
-			10_000,
-		).catch(() => {});
-	};
-
-	if (args.signal?.aborted) return abortedBeforeAdmission(run);
+	if (args.signal?.aborted) return abortedBeforeAdmission();
+	const museModelId = resolveMuseModelId(args.modelId);
+	let host: MuseHost;
+	try {
+		host = await abortable(ensureHost(args.sandboxed), args.signal);
+	} catch (error) {
+		if (args.signal?.aborted) return abortedBeforeAdmission();
+		throw error;
+	}
+	if (activeRuns.has(args.sessionId)) throw new Error("This Muse session already has an active turn");
+	const run = new TurnRun({
+		host, sessionId: args.sessionId, thinkingLevel: args.thinkingLevel,
+		onTextDelta: args.onTextDelta, onTextSnapshot: args.onTextSnapshot,
+		onReasoningDelta: args.onReasoningDelta, onActivityDelta: args.onActivityDelta,
+		onTodoSnapshot: args.onTodoSnapshot,
+	});
 	const turnCommand = uuidv7();
-	// Fresh turn: turnId == commandId (WIRE.md; every ack in msdv_B1/B2/C1b/C3). Own the id before ANY frame can
-	// arrive: session/resume of a session orphaned by host death emits its `cancelled` terminal
-	// (resume_reconcile:orphaned_by_process_loss) while session/resume or session/setModel is still pending — before
-	// turn/start is ever sent — so allocating the id only at turn/start still lets that orphan resolve the run.
 	run.turnId = turnCommand;
 	activeRuns.set(args.sessionId, run);
-	let createdSession = false;
+	const abortHandler = () => run.markInterrupted();
+	const request = (method: string, params: Frame) => abortable(host.request(method, params, 20_000), args.signal);
+	const waitTerminal = () => Promise.race([run.terminal, host.exitPromise]);
+	let admitted = false;
+	let turnStartSent = false;
 	try {
-		const alreadyLoaded = sessionsOnHost.get(args.sessionId) === host;
-		const museModelId = resolveMuseModelId(args.modelId);
-		if (!alreadyLoaded) {
-			const startParams: Frame = { commandId: uuidv7(), sessionId: args.sessionId, workspaceRoot: args.workspace, approvalMode: "allowAll", modelId: museModelId };
+		let createdSession = false;
+		if (sessionsOnHost.get(args.sessionId) !== host) {
+			const startParams: Frame = {
+				commandId: uuidv7(), sessionId: args.sessionId, workspaceRoot: args.workspace,
+				approvalMode: "allowAll", modelId: museModelId,
+			};
 			const resumeParams: Frame = { commandId: uuidv7(), sessionId: args.sessionId };
 			let openedWithStart = !args.resumeExisting;
 			let opened: Frame;
 			try {
-				if (args.resumeExisting) opened = await host.request("session/resume", resumeParams, 20_000);
-				else opened = await host.request("session/start", startParams, 20_000);
+				opened = args.resumeExisting
+					? await request("session/resume", resumeParams)
+					: await request("session/start", startParams);
 			} catch (error) {
+				if (args.signal?.aborted) throw error;
 				const kind = error instanceof MspRequestError ? error.kind : undefined;
-				const sessionAlreadyExists = kind === "sessionInUse" ||
-					kind === "invalidParams" ||
-					kind === "sessionNotFound" ||
+				// Muse 1.0.3 reports an existing ID through commandRejected rather than sessionInUse.
+				const exists = kind === "sessionInUse" ||
 					(kind === "commandRejected" && /already exists or is reserved/i.test(errorMessage(error)));
-				if (!args.resumeExisting && sessionAlreadyExists) {
-					opened = await host.request("session/resume", { ...resumeParams, commandId: uuidv7() }, 20_000);
+				if (!args.resumeExisting && exists) {
+					opened = await request("session/resume", { ...resumeParams, commandId: uuidv7() });
 					openedWithStart = false;
 				} else if (args.resumeExisting && kind === "sessionNotFound") {
-					opened = await host.request("session/start", { ...startParams, commandId: uuidv7() }, 20_000);
+					opened = await request("session/start", { ...startParams, commandId: uuidv7() });
 					openedWithStart = true;
 				} else {
 					throw new HostUnavailableError(`Muse host could not open session ${args.sessionId}: ${errorMessage(error)}`, error);
 				}
 			}
-			// An empty `viewCursor` means the host will stream no view notifications for this session (observed on
-			// muse 1.0.3 resuming sessions it did not just create). The turn would run and settle durably while this
-			// client waited forever, so refuse before admission and let the caller take the exec fallback instead.
 			if (!text(opened.viewCursor)) {
-				throw new MuseSessionUnusableError(`Muse host opened session ${args.sessionId} without a live view stream (empty viewCursor); it cannot be observed`);
+				throw new MuseSessionUnusableError(`Muse session ${args.sessionId} has an empty viewCursor and cannot be observed`);
 			}
 			sessionsOnHost.set(args.sessionId, host);
 			createdSession = openedWithStart;
-			if (openedWithStart) sessionModelOnHost.set(args.sessionId, museModelId);
+			if (createdSession) sessionModelOnHost.set(args.sessionId, museModelId);
 		}
 		if (sessionModelOnHost.get(args.sessionId) !== museModelId) {
-			await host.request("session/setModel", { commandId: uuidv7(), sessionId: args.sessionId, model: { modelId: museModelId } }, 20_000);
+			await request("session/setModel", {
+				commandId: uuidv7(), sessionId: args.sessionId, model: { modelId: museModelId },
+			});
 			sessionModelOnHost.set(args.sessionId, museModelId);
 		}
-		// A cancel that lands while session/start|resume or setModel was in flight is a user decision, not a host
-		// failure: report it as an interrupted turn so streamMuse never falls back to `muse exec` for it.
-		if (args.signal?.aborted) return abortedBeforeAdmission(run);
-		// Use the caller's initial prompt only for a session this call actually created: the OMP transcript cannot
-		// tell whether the Muse-side session still exists (a deleted backend session leaves prior muse-code
-		// assistant entries behind), so the start-vs-resume outcome is the only sound signal for "no history yet".
-		// Selected wholesale — never concatenated — so the task cannot appear twice.
-		const firstInput = createdSession && args.initialPrompt ? args.initialPrompt : args.prompt;
-		const ack = await host.request("turn/start", {
-			commandId: turnCommand,
-			sessionId: args.sessionId,
+		if (args.signal?.aborted) return abortedBeforeAdmission(run.diagnostics);
+		args.signal?.addEventListener("abort", abortHandler, { once: true });
+		const firstInput = createdSession ? args.initialPrompt?.() ?? args.prompt : args.prompt;
+		turnStartSent = true;
+		const ack = await request("turn/start", {
+			commandId: turnCommand, sessionId: args.sessionId,
 			input: [{ type: "text", text: firstInput }],
 			...(args.thinkingLevel ? { reasoningEffort: museThinkingLevel(args.thinkingLevel) } : {}),
-		}, 20_000);
-		run.turnId = text(ack.turnId) || turnCommand;
+		});
+		// The command ID already owns early notifications; do not rewind a successor adopted before the ack.
+		if (run.turnId === turnCommand) run.turnId = text(ack.turnId) || turnCommand;
 		admitted = true;
-		if (args.signal) args.signal.addEventListener("abort", abortHandler, { once: true });
 		if (args.signal?.aborted) abortHandler();
-
-		// Race the turn against host death: `run.terminal` is not a pending request, so
-		// a `muse serve` crash after admission would otherwise await forever. Registry
-		// cleanup (activeHost/sessionsOnHost) happens in ensureHost's exitPromise catch;
-		// this yields the admitted-turn error (no exec fallback: the turn already ran).
-		const terminal = await Promise.race([
-			run.terminal,
-			host.exitPromise.then((never_): TurnTerminal => {
-				void never_;
-				return { terminal: "failed", errorText: "muse serve exited during turn", interrupted: false };
-			}),
-		]);
-		const usage = mapUsage(run.tokenUsage);
+		const terminal = await waitTerminal();
+		if (!args.signal?.aborted && terminal.terminal !== "cancelled") await abortable(run.drainCatchUp(), args.signal);
+		const usage = { ...(run.tokenUsage ?? EMPTY_USAGE) };
+		if (!usage.turns) usage.turns = 1;
+		const backendInterrupted = !terminal.localAbort && terminal.terminal === "cancelled";
 		if (args.signal?.aborted || terminal.interrupted || terminal.terminal === "cancelled") {
-			return { output: run.finalText, usage, diagnostics: run.diagnostics, aborted: true, errorMessage: "Muse turn was interrupted" };
-		}
-		if (terminal.terminal !== "completed") {
-			return { output: run.finalText, usage, diagnostics: run.diagnostics, errorMessage: terminal.errorText ?? `Muse turn ended: ${terminal.terminal}` };
-		}
-		return { output: run.finalText, usage, diagnostics: run.diagnostics };
-	} catch (error) {
-		if (!admitted) {
-			if (args.signal?.aborted) return abortedBeforeAdmission(run);
-			throw error instanceof HostUnavailableError ? error : new HostUnavailableError(`Muse host turn failed before admission: ${errorMessage(error)}`, error);
+			return {
+				output: run.finalText, usage, diagnostics: run.diagnostics, aborted: true, backendInterrupted,
+				errorMessage: terminal.localAbort
+					? "Muse cancellation requested; backend termination was not confirmed"
+					: "Muse turn was interrupted",
+			};
 		}
 		return {
-			output: run.finalText,
-			usage: mapUsage(run.tokenUsage),
-			diagnostics: run.diagnostics,
-			errorMessage: errorMessage(error),
+			output: run.finalText, usage, diagnostics: run.diagnostics,
+			...(terminal.terminal !== "completed" ? { errorMessage: terminal.errorText ?? `Muse turn ended: ${terminal.terminal}` } : {}),
+		};
+	} catch (error) {
+		if (!turnStartSent) {
+			if (args.signal?.aborted) return abortedBeforeAdmission(run.diagnostics);
+			if (error instanceof HostUnavailableError || error instanceof MuseSessionUnusableError) throw error;
+			throw new HostUnavailableError(`Muse host failed before admission: ${errorMessage(error)}`, error);
+		}
+		let cancellation: TurnTerminal | undefined;
+		if (!admitted || args.signal?.aborted) {
+			run.markInterrupted();
+			try {
+				cancellation = await waitTerminal();
+			} catch {
+				// Host death is already represented by the original request failure.
+			}
+		}
+		return {
+			output: run.finalText, usage: { ...(run.tokenUsage ?? EMPTY_USAGE) }, diagnostics: run.diagnostics,
+			errorMessage: args.signal?.aborted && (!cancellation || cancellation.localAbort)
+				? "Muse cancellation requested; backend termination was not confirmed"
+				: errorMessage(error),
 			aborted: args.signal?.aborted === true,
+			backendInterrupted: cancellation?.terminal === "cancelled" && !cancellation.localAbort,
 		};
 	} finally {
 		run.settle();
-		if (args.signal) args.signal.removeEventListener("abort", abortHandler);
+		args.signal?.removeEventListener("abort", abortHandler);
 		if (activeRuns.get(args.sessionId) === run) activeRuns.delete(args.sessionId);
 	}
 }

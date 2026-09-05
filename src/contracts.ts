@@ -1,22 +1,22 @@
-/**
- * Shared vocabulary between the exec path (runtime.ts) and the session-host
- * path (msp.ts). This module MUST stay dependency-free (node builtins only) so
- * msp.ts remains loadable in plain `bun test` without the host-only
- * `@oh-my-pi/pi-coding-agent` resolution that runtime.ts requires.
- */
+/** Transport-independent types shared by the Muse host and exec adapters. */
 
 export type MuseThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface MuseUsage {
+	/** Uncached prompt tokens, matching OMP's usage convention. */
 	input: number;
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	/** Counted-once prompt and output tokens, including cached prompt tokens. */
+	totalTokens: number;
 	cost: number;
-	contextTokens: number;
+	/** Latest measured occupancy; absent when the backend has not reported it. */
+	contextTokens?: number;
 	turns: number;
 }
 
+/** Translate OMP thinking levels to Muse's reasoning-effort vocabulary. */
 export function museThinkingLevel(level: MuseThinkingLevel | undefined): string | undefined {
 	if (level === "off") return "none";
 	if (level === "max") return "ultra";
