@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getAgentDir } from "@oh-my-pi/pi-utils";
 import {
 	type Api,
 	type AssistantMessage,
@@ -10,7 +13,7 @@ import {
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { getMuseCatalog, type MuseCatalogModel } from "./catalog.ts";
 import { loadMuseSystemPrompt, runMuse } from "./runtime.ts";
-import { HostUnavailableError, runMuseTurn, shutdownHost, steerActiveMuseRuns, uuidv7 } from "./msp.ts";
+import { HostUnavailableError, type MuseTodoEntry, MuseSessionUnusableError, runMuseTurn, shutdownHost, steerActiveMuseRuns, uuidv7 } from "./msp.ts";
 
 const MUSE_API = "muse-code-cli" as Api;
 const ALIAS_ID = "muse-spark";
@@ -114,13 +117,55 @@ function serializeContext(context: Context): string {
 		`<conversation_history format="json">\n${JSON.stringify(messages, null, 2)}\n</conversation_history>`;
 }
 
+/** Where the OMP-session -> Muse-session mapping lives, so continuity survives an OMP restart. */
+function sessionMapPath(): string {
+	return path.join(getAgentDir(), "omp-muse-bridge-sessions.json");
+}
+
+function readSessionMap(): Record<string, string> {
+	try {
+		const parsed: unknown = JSON.parse(fs.readFileSync(sessionMapPath(), "utf8"));
+		if (!parsed || typeof parsed !== "object") return {};
+		const map: Record<string, string> = {};
+		for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+			if (typeof value === "string" && value) map[key] = value;
+		}
+		return map;
+	} catch {
+		return {};
+	}
+}
+
+function rememberMuseSession(ompSessionId: string, museSessionId: string): void {
+	try {
+		const map = readSessionMap();
+		map[ompSessionId] = museSessionId;
+		// Bound the file: keep the newest 200 mappings (object order is insertion order for string keys).
+		const entries = Object.entries(map).slice(-200);
+		fs.mkdirSync(path.dirname(sessionMapPath()), { recursive: true });
+		fs.writeFileSync(sessionMapPath(), `${JSON.stringify(Object.fromEntries(entries), null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	} catch {
+		// A mapping we cannot persist only costs continuity after a restart; never fail a turn for it.
+	}
+}
+
 /**
- * Muse session identity is deliberately NOT the OMP session id. Reusing it forced the bridge to `session/resume` a
- * session it did not create, and such resumes were observed returning an empty `viewCursor` with zero live view
- * notifications on muse 1.0.3 — the turn ran and completed durably while the bridge waited forever. A minted id is
- * opened with `session/start`, which streams; later turns in this process reuse it without resuming. The
- * session-scoped `providerSessionState` is the only store, so a new OMP session (or process) mints a new Muse
- * session and re-seeds it with context.
+ * Latest todo snapshot Muse published, per OMP session. Held here rather than inlined into the thinking stream so
+ * the panel below owns its presentation: thinking text renders in one theme colour, a Component does not.
+ */
+const musePlans = new Map<string, MuseTodoEntry[]>();
+let requestPlanRender: (() => void) | undefined;
+
+function recordMusePlan(sessionKey: string, entries: MuseTodoEntry[]): void {
+	musePlans.set(sessionKey, entries);
+	requestPlanRender?.();
+}
+
+/**
+ * Muse session identity is NOT the OMP session id: reusing it made the bridge `session/resume` a session it never
+ * created, and such resumes can return an empty `viewCursor` with zero live events. Instead the bridge mints an id
+ * and records `OMP id -> Muse id` on disk, so resuming the same OMP session after a restart reattaches the same
+ * Muse session. If that resume turns out to be unobservable, `streamMuse` mints a replacement and re-seeds context.
  */
 function museSessionState(options: SimpleStreamOptions | undefined): MuseProviderSessionState | undefined {
 	// No session-scoped store means no way to keep one Muse session across turns; the caller's no-session path
@@ -129,7 +174,11 @@ function museSessionState(options: SimpleStreamOptions | undefined): MuseProvide
 	if (!options?.sessionId || !options.providerSessionState) return undefined;
 	const existing = options.providerSessionState.get(MUSE_API) as MuseProviderSessionState | undefined;
 	if (existing) return existing;
-	const created: MuseProviderSessionState = { sessionId: uuidv7(), initialized: false, close() {} };
+	const remembered = readSessionMap()[options.sessionId];
+	const museSessionId = remembered ?? uuidv7();
+	if (!remembered) rememberMuseSession(options.sessionId, museSessionId);
+	// `initialized` drives resumeExisting: a remembered session already has history, a fresh one does not.
+	const created: MuseProviderSessionState = { sessionId: museSessionId, initialized: remembered !== undefined, close() {} };
 	options.providerSessionState.set(MUSE_API, created);
 	return created;
 }
@@ -377,9 +426,9 @@ export function streamMuse(
 			const thinkingLevel = options?.disableReasoning ? "off" : options?.reasoning;
 			if (sessionState) {
 				try {
-					const outcome = await runMuseTurn({
-						sessionId: sessionState.sessionId,
-						resumeExisting: sessionState.initialized,
+					const runTurn = (sessionId: string, resumeExisting: boolean) => runMuseTurn({
+						sessionId,
+						resumeExisting,
 						prompt,
 						initialPrompt,
 						modelId: model.id,
@@ -390,7 +439,23 @@ export function streamMuse(
 						onTextDelta: pushTextDelta,
 						onReasoningDelta: options?.hideThinkingSummary ? undefined : pushThinkingDelta,
 						onActivityDelta: pushThinkingDelta,
+						onTodoSnapshot: options?.sessionId ? (entries) => recordMusePlan(options.sessionId as string, entries) : undefined,
 					});
+					let outcome: Awaited<ReturnType<typeof runMuseTurn>>;
+					try {
+						outcome = await runTurn(sessionState.sessionId, sessionState.initialized);
+					} catch (error) {
+						// A remembered session the current host cannot stream (empty viewCursor) is unusable, but the
+						// host is fine: mint a replacement, re-point the mapping, and re-seed it with context. No
+						// turn has started yet, so this cannot duplicate work.
+						if (!(error instanceof MuseSessionUnusableError)) throw error;
+						onDiagnostic?.(`${error.message}; starting a fresh Muse session for this OMP session`);
+						const replacement = uuidv7();
+						if (options?.sessionId) rememberMuseSession(options.sessionId, replacement);
+						sessionState.sessionId = replacement;
+						sessionState.initialized = false;
+						outcome = await runTurn(replacement, false);
+					}
 					sessionState.initialized = true;
 					for (const message of outcome.diagnostics) onDiagnostic?.(message);
 					const finalText = outcome.output || (outcome.errorMessage ? "" : "(no output from Muse)");
@@ -513,6 +578,24 @@ export function registerMuseProvider(pi: ExtensionAPI): void {
 		const lines = textValue.replace(/\n{4,}/g, "\n\n\n").split("\n");
 		const rendered = [`↳ steered Muse: ${lines[0] ?? ""}`, ...lines.slice(1).map((line) => `  ${line}`)];
 		return { render: () => rendered };
+	});
+	// Muse's plan rendered as a themed panel. `registerAssistantThinkingRenderer` runs after the thinking text with
+	// the live theme, which is the only public surface that can colour per element — thinking text itself is painted
+	// one colour. The plan is deliberately absent from that text, so nothing is duplicated.
+	pi.registerAssistantThinkingRenderer((context, theme) => {
+		requestPlanRender = context.requestRender;
+		const entries = [...musePlans.values()].at(-1);
+		if (!entries?.length) return undefined;
+		const rows = [theme.fg("border", "  ── Muse plan ──")];
+		for (const { label, status } of entries) {
+			const done = /done|complete/i.test(status);
+			const active = /progress|active|doing/i.test(status);
+			const cancelled = /cancel|drop/i.test(status);
+			const glyph = active ? "▶" : done ? "✔" : cancelled ? "✖" : "◻";
+			const colour = active ? "accent" : done ? "success" : cancelled ? "error" : "muted";
+			rows.push(`  ${theme.fg(colour, glyph)} ${theme.fg(done || cancelled ? "dim" : "text", label)}`);
+		}
+		return { render: () => rows };
 	});
 	pi.on("session_shutdown", () => shutdownHost());
 	pi.registerProvider("muse-code", {

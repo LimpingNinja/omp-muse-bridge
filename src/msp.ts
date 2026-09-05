@@ -29,6 +29,18 @@ export class HostUnavailableError extends Error {
 	}
 }
 
+/**
+ * The host opened the session but will stream no view events for it (empty `viewCursor`, observed when muse 1.0.3
+ * resumes a session an earlier host created). The turn has NOT started, so the caller can recover by opening a
+ * different session — unlike `HostUnavailableError`, this says nothing about the host's health.
+ */
+export class MuseSessionUnusableError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "MuseSessionUnusableError";
+	}
+}
+
 export function uuidv7(): string {
 	const bytes = new Uint8Array(16);
 	crypto.getRandomValues(bytes);
@@ -238,8 +250,15 @@ class MuseHost {
 // Host management + tier-2 run registry
 
 let hostPromise: Promise<MuseHost> | null = null;
+/** One entry of Muse's todo snapshot, normalized for callers that render it themselves. */
+export interface MuseTodoEntry {
+	label: string;
+	status: string;
+}
+
 let activeHost: MuseHost | null = null;
 const sessionsOnHost = new Map<string, MuseHost>();
+
 const sessionModelOnHost = new Map<string, string>();
 
 export interface MuseRequester {
@@ -287,6 +306,7 @@ export class TurnRun {
 		private readonly onReasoningDelta?: (delta: string) => void,
 		private readonly onActivityDelta?: (delta: string) => void,
 		thinkingLevel?: MuseThinkingLevel,
+		private readonly onTodoSnapshot?: (entries: MuseTodoEntry[]) => void,
 	) {
 		this.reasoningEffort = museThinkingLevel(thinkingLevel);
 		const { promise, resolve } = Promise.withResolvers<TurnTerminal>();
@@ -328,21 +348,31 @@ export class TurnRun {
 	 * Muse's todo list rendered as readable lines, so a plan update is visible instead of an opaque tool call.
 	 * Muse spells the collection `todos` or `items`, and the entry label `text` (also seen: content/title/task).
 	 */
-	private static todoLines(record: Frame | undefined): string {
-		if (!record) return "";
-		const entries = Array.isArray(record.todos) ? record.todos : Array.isArray(record.items) ? record.items : undefined;
-		if (!entries) return "";
-		return entries.slice(0, 20).map((entry) => {
+	private static todoEntries(record: Frame | undefined): MuseTodoEntry[] {
+		if (!record) return [];
+		const raw = Array.isArray(record.todos) ? record.todos : Array.isArray(record.items) ? record.items : undefined;
+		if (!raw) return [];
+		const parsed: MuseTodoEntry[] = [];
+		for (const entry of raw.slice(0, 20)) {
 			const todo = asRecord(entry);
-			if (!todo) return "";
-			const label = text(todo.text) || text(todo.content) || text(todo.title) || text(todo.task);
-			if (!label) return "";
-			const state = text(todo.status) || text(todo.state) || "pending";
-			const glyph = /progress|active|doing/i.test(state) ? "▶" : /done|complete/i.test(state) ? "✔" : /cancel|drop/i.test(state) ? "✖" : "◻";
-			const flat = label.replace(/\s+/g, " ").trim();
-			const shown = flat.length > 100 ? `${flat.slice(0, 99)}…` : flat;
-			return `- ${glyph} ${/done|complete/i.test(state) ? `~~${shown}~~` : shown}`;
-		}).filter(Boolean).join("\n");
+			if (!todo) continue;
+			const label = (text(todo.text) || text(todo.content) || text(todo.title) || text(todo.task)).replace(/\s+/g, " ").trim();
+			if (!label) continue;
+			parsed.push({
+				label: label.length > 100 ? `${label.slice(0, 99)}…` : label,
+				status: text(todo.status) || text(todo.state) || "pending",
+			});
+		}
+		return parsed;
+	}
+
+	/** Markdown fallback used when no consumer renders the snapshot itself. */
+	private static renderTodoLines(entries: MuseTodoEntry[]): string {
+		return entries.map(({ label, status }) => {
+			const done = /done|complete/i.test(status);
+			const glyph = /progress|active|doing/i.test(status) ? "▶" : done ? "✔" : /cancel|drop/i.test(status) ? "✖" : "◻";
+			return `- ${glyph} ${done ? `~~${label}~~` : label}`;
+		}).join("\n");
 	}
 
 	/**
@@ -389,12 +419,17 @@ export class TurnRun {
 			const tool = text(item.tool) || "tool";
 			const args = TurnRun.toolArgs(text(item.args));
 			const target = TurnRun.primaryArgument(args);
-			// A todo update is a plan, not tool noise: show the list and hide the call itself entirely.
+			// A todo update is a plan, not tool noise: the call itself is always hidden. Hand structured entries to a
+			// consumer that renders them (a themed panel); only inline the list when nobody consumes snapshots.
 			if (/todo/i.test(tool)) {
 				if (terminal) return;
-				const lines = TurnRun.todoLines(args);
-				if (!lines) return;
-				message = `${MUSE_TAG} plan\n${lines}`;
+				const entries = TurnRun.todoEntries(args);
+				if (!entries.length) return;
+				if (this.onTodoSnapshot) {
+					this.onTodoSnapshot(entries);
+					return;
+				}
+				message = `${MUSE_TAG} plan\n${TurnRun.renderTodoLines(entries)}`;
 			} else if (!terminal) {
 				message = /^web_search$/i.test(tool)
 					? `${MUSE_TAG} 🔎 searched ${target ? `\`${target}\`` : "(query unavailable)"}`
@@ -750,6 +785,8 @@ export interface MuseTurnArgs {
 	onTextDelta?: (delta: string) => void;
 	onReasoningDelta?: (delta: string) => void;
 	onActivityDelta?: (delta: string) => void;
+	/** Latest Muse todo snapshot for this turn; the caller renders it (OMP has no todo-write API for extensions). */
+	onTodoSnapshot?: (entries: MuseTodoEntry[]) => void;
 }
 
 export interface MuseTurnOutcome {
@@ -789,7 +826,7 @@ function mapUsage(usage: Frame | undefined): MuseUsage {
  */
 export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> {
 	const host = await ensureHost(args.sandboxed);
-	const run = new TurnRun(host, args.sessionId, args.onTextDelta, args.onReasoningDelta, args.onActivityDelta, args.thinkingLevel);
+	const run = new TurnRun(host, args.sessionId, args.onTextDelta, args.onReasoningDelta, args.onActivityDelta, args.thinkingLevel, args.onTodoSnapshot);
 	let admitted = false;
 
 	const abortHandler = () => {
@@ -841,7 +878,7 @@ export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> 
 			// muse 1.0.3 resuming sessions it did not just create). The turn would run and settle durably while this
 			// client waited forever, so refuse before admission and let the caller take the exec fallback instead.
 			if (!text(opened.viewCursor)) {
-				throw new HostUnavailableError(`Muse host opened session ${args.sessionId} without a live view stream (empty viewCursor); refusing to run a turn it cannot observe`);
+				throw new MuseSessionUnusableError(`Muse host opened session ${args.sessionId} without a live view stream (empty viewCursor); it cannot be observed`);
 			}
 			sessionsOnHost.set(args.sessionId, host);
 			createdSession = openedWithStart;
