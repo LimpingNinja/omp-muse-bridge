@@ -370,7 +370,7 @@ export class TurnRun {
 	private static renderTodoLines(entries: MuseTodoEntry[]): string {
 		return entries.map(({ label, status }) => {
 			const done = /done|complete/i.test(status);
-			const glyph = /progress|active|doing/i.test(status) ? "▶" : done ? "✔" : /cancel|drop/i.test(status) ? "✖" : "◻";
+			const glyph = /progress|active|doing/i.test(status) ? "▸" : done ? "✓" : /cancel|drop/i.test(status) ? "✗" : "□";
 			return `- ${glyph} ${done ? `~~${label}~~` : label}`;
 		}).join("\n");
 	}
@@ -391,16 +391,19 @@ export class TurnRun {
 	/** Hosts a web tool actually reached, so a search reports its sources without pasting page text. */
 	private static resultSites(item: Frame): string {
 		const hosts: string[] = [];
-		for (const match of text(item.visibleOutput).matchAll(/https?:\/\/\S+/g)) {
+		// The class stops where prose and Markdown put delimiters after a URL. A bare `\S+` captured
+		// `https://omp.sh)**`, and `new URL` keeps `)` and `*` in the host, so one site was reported twice under two
+		// spellings. Truncating a path early is harmless here: only the host is used.
+		for (const match of text(item.visibleOutput).matchAll(/https?:\/\/[^\s"'`<>()[\]{}*|\\]+/g)) {
 			let host = "";
 			try {
-				// Trim characters that commonly trail a URL in prose/JSON before parsing.
-				host = new URL(match[0].replace(/[)\]}>"',.;:]+$/, "").replace(/\\[a-z].*$/i, "")).hostname;
+				host = new URL(match[0].replace(/[.,;:!?]+$/, "")).hostname.replace(/^www\./, "").toLowerCase();
 			} catch {
 				continue;
 			}
-			host = host.replace(/^www\./, "");
-			if (host && !hosts.includes(host)) hosts.push(host);
+			// Backstop: `new URL` accepts hosts no name server would; report only label-shaped ones.
+			if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/.test(host)) continue;
+			if (!hosts.includes(host)) hosts.push(host);
 			if (hosts.length === 5) break;
 		}
 		return hosts.join(", ");
@@ -439,7 +442,7 @@ export class TurnRun {
 			} else {
 				const sites = /^web_(search|fetch)$/i.test(tool) ? TurnRun.resultSites(item) : "";
 				const detail = sites ? `sources: ${sites}` : TurnRun.resultSummary(item) || fallback;
-				const glyph = status === "completed" ? "✔" : status === "failed" ? "✖" : "•";
+				const glyph = status === "completed" ? "✓" : status === "failed" ? "✗" : "•";
 				const outcome = status === "completed" ? "finished" : status;
 				message = `${MUSE_TAG} ${glyph} \`${tool}\` ${outcome}${target ? ` on \`${target}\`` : ""}${detail ? ` — ${detail}` : ""}`;
 			}

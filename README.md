@@ -7,7 +7,7 @@ Turns run over a persistent `muse serve` session host, so a Muse session keeps i
 restarts. The plugin does not add a subagent tool and does not need a modified subagent host; it also ships a
 `muse-spark` agent definition so OMP's own `subagent` tool can delegate to Muse.
 
-Version 0.4.3.
+Version 0.4.4.
 
 ## Screenshots
 

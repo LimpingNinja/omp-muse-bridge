@@ -591,7 +591,10 @@ export function registerMuseProvider(pi: ExtensionAPI): void {
 			const done = /done|complete/i.test(status);
 			const active = /progress|active|doing/i.test(status);
 			const cancelled = /cancel|drop/i.test(status);
-			const glyph = active ? "▶" : done ? "✔" : cancelled ? "✖" : "◻";
+			// Text-presentation glyphs only: the U+2714/U+2716/U+25B6/U+25FB set these replaced all carry the Unicode
+			// Emoji property, so terminals with an emoji fallback font drew them wider than the one cell every width
+			// table assigns, covering the following space and shifting the row left.
+			const glyph = active ? "▸" : done ? "✓" : cancelled ? "✗" : "□";
 			const colour = active ? "accent" : done ? "success" : cancelled ? "error" : "muted";
 			rows.push(`  ${theme.fg(colour, glyph)} ${theme.fg(done || cancelled ? "dim" : "text", label)}`);
 		}

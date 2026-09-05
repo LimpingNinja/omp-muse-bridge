@@ -67,7 +67,7 @@ test("tool activity names the tool and its target, and reports no raw output", (
 	});
 
 	expect(activity[0]).toBe("**[Muse]** → called `edit_file` on `src/models.py`");
-	expect(activity[1]).toBe("**[Muse]** ✔ `edit_file` finished on `src/models.py`");
+	expect(activity[1]).toBe("**[Muse]** ✓ `edit_file` finished on `src/models.py`");
 	expect(activity.join("\n")).not.toContain("SECRET FILE CONTENTS");
 	run.settle();
 });
@@ -95,5 +95,29 @@ test("todo calls are hidden and delivered as a structured snapshot", () => {
 		{ label: "Push", status: "pending" },
 	]]);
 	expect(activity).toEqual([]); // the call itself is never printed
+	run.settle();
+});
+
+test("web sources report one label-shaped host per site, whatever punctuation trails the URL", () => {
+	const activity: string[] = [];
+	const run = new TurnRun(acceptingHost(), "session-1", undefined, undefined, (delta) => activity.push(delta.trim()));
+	run.turnId = "turn-1";
+
+	run.handleNotification("item/completed", {
+		sessionId: "session-1",
+		item: {
+			itemId: "t3",
+			kind: "toolCall",
+			turnId: "turn-1",
+			status: "completed",
+			tool: "web_search",
+			args: JSON.stringify({ query: "oh-my-pi plugin manager" }),
+			// Markdown emphasis, a Markdown link, a sentence period and a duplicate: every one of these produced a
+			// bogus extra "host" (`omp.sh)**`) or a duplicate before the URL match was delimiter-aware.
+			visibleOutput: "**[omp](https://omp.sh)** and https://omp.sh/docs plus [bun](https://bun.sh), then https://pi.dev.",
+		},
+	});
+
+	expect(activity).toEqual(["**[Muse]** ✓ `web_search` finished on `oh-my-pi plugin manager` — sources: omp.sh, bun.sh, pi.dev"]);
 	run.settle();
 });
