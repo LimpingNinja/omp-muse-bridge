@@ -480,6 +480,10 @@ export function registerMuseProvider(pi: ExtensionAPI): void {
 	});
 	pi.on("input", async (event, ctx) => {
 		if (event.source !== "interactive") return;
+		// HARD GATE: this hook sees every interactive message in the session, including turns aimed at other
+		// providers. Unless the active model is a Muse model, the bridge has no business touching the input — a
+		// stale run in the registry must never swallow a message meant for another model.
+		if (ctx.model?.provider !== "muse-code") return;
 		// Slash commands and OMP queue markers belong to OMP's own parser; this hook
 		// fires before it. Queue semantics ride OMP's next streamSimple call — the
 		// bridge claims no MSP queue/unqueue support.
@@ -504,8 +508,11 @@ export function registerMuseProvider(pi: ExtensionAPI): void {
 			: Array.isArray(content)
 				? content.map((part) => part.type === "text" ? part.text : "[image]").join(" ")
 				: "";
-		const line = `↳ steered Muse: ${textValue.replace(/\s+/g, " ").trim()}`;
-		return { render: () => [line] };
+		// Full text, line breaks preserved: a flattened one-liner made long steers unreadable and unrecoverable
+		// from the transcript. Only collapse 3+ consecutive blank lines; never drop content.
+		const lines = textValue.replace(/\n{4,}/g, "\n\n\n").split("\n");
+		const rendered = [`↳ steered Muse: ${lines[0] ?? ""}`, ...lines.slice(1).map((line) => `  ${line}`)];
+		return { render: () => rendered };
 	});
 	pi.on("session_shutdown", () => shutdownHost());
 	pi.registerProvider("muse-code", {

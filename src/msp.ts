@@ -15,6 +15,13 @@ const SUCCESSOR_GRACE_MS = 5_000;
 /** Grace after a user abort before the run settles itself as cancelled, regardless of host terminals. */
 const ABORT_SETTLE_MS = 3_000;
 
+/**
+ * Prefix for every bridge-authored activity line. Emitted as Markdown: OMP renders thinking content through its
+ * Markdown pipeline, so bold/inline-code/lists/links/emoji all render (colour comes from the thinking theme, and
+ * fenced code blocks are elided under `proseOnlyThinking` — hence inline code only).
+ */
+const MUSE_TAG = "**[Muse]**";
+
 export class HostUnavailableError extends Error {
 	constructor(message: string, readonly cause?: unknown) {
 		super(message);
@@ -261,8 +268,12 @@ export class TurnRun {
 	private readonly terminalResolvers: { resolve: (v: TurnTerminal) => void };
 	readonly terminal: Promise<TurnTerminal>;
 	readonly diagnostics: string[] = [];
-	/** turn/steer acks not yet matched by a `userMessage{steered:true}` item — the host still owes an answer. */
-	private outstandingSteers = 0;
+	/**
+	 * True between an acked `turn/steer` and the `userMessage{steered:true}` that answers it. A boolean cannot drift
+	 * the way a counter does when steers are queued, rejected, or coalesced by the host — a stuck count would re-arm
+	 * the successor hold on every terminal and keep the run registered after the turn is really over.
+	 */
+	private awaitingSteeredAnswer = false;
 	/** This turn's `completed` terminal, parked while a successor run is expected for an outstanding steer. */
 	private heldTerminal: TurnTerminal | undefined;
 	private successorTimer: ReturnType<typeof setTimeout> | undefined;
@@ -302,7 +313,7 @@ export class TurnRun {
 	/** Most informative argument for a tool call, by the field names Muse's tools actually use. */
 	private static primaryArgument(record: Frame | undefined): string {
 		if (!record) return "";
-		for (const key of ["path", "file_path", "filePath", "target_file", "query", "url", "pattern", "glob", "command", "objective", "prompt"]) {
+		for (const key of ["description", "path", "file_path", "filePath", "target_file", "query", "url", "pattern", "glob", "command", "objective", "prompt"]) {
 			const value = record[key];
 			if (typeof value === "string" && value.trim()) {
 				const flat = value.replace(/\s+/g, " ").trim();
@@ -327,8 +338,10 @@ export class TurnRun {
 			const label = text(todo.text) || text(todo.content) || text(todo.title) || text(todo.task);
 			if (!label) return "";
 			const state = text(todo.status) || text(todo.state) || "pending";
+			const glyph = /progress|active|doing/i.test(state) ? "▶" : /done|complete/i.test(state) ? "✔" : /cancel|drop/i.test(state) ? "✖" : "◻";
 			const flat = label.replace(/\s+/g, " ").trim();
-			return `  • ${state}: ${flat.length > 100 ? `${flat.slice(0, 99)}…` : flat}`;
+			const shown = flat.length > 100 ? `${flat.slice(0, 99)}…` : flat;
+			return `- ${glyph} ${/done|complete/i.test(state) ? `~~${shown}~~` : shown}`;
 		}).filter(Boolean).join("\n");
 	}
 
@@ -381,30 +394,31 @@ export class TurnRun {
 				if (terminal) return;
 				const lines = TurnRun.todoLines(args);
 				if (!lines) return;
-				message = `[Muse] plan:\n${lines}`;
+				message = `${MUSE_TAG} plan\n${lines}`;
 			} else if (!terminal) {
 				message = /^web_search$/i.test(tool)
-					? `[Muse] searched: ${target || "(query unavailable)"}`
+					? `${MUSE_TAG} 🔎 searched ${target ? `\`${target}\`` : "(query unavailable)"}`
 					: /^web_fetch$/i.test(tool)
-						? `[Muse] fetched ${target || "(url unavailable)"}`
-						: `[Muse] called ${tool}${target ? ` on ${target}` : ""}`;
+						? `${MUSE_TAG} 🌐 fetched ${target ? `\`${target}\`` : "(url unavailable)"}`
+						: `${MUSE_TAG} → called \`${tool}\`${target ? ` on \`${target}\`` : ""}`;
 			} else {
 				const sites = /^web_(search|fetch)$/i.test(tool) ? TurnRun.resultSites(item) : "";
 				const detail = sites ? `sources: ${sites}` : TurnRun.resultSummary(item) || fallback;
+				const glyph = status === "completed" ? "✔" : status === "failed" ? "✖" : "•";
 				const outcome = status === "completed" ? "finished" : status;
-				message = `[Muse] ${tool} ${outcome}${target ? ` on ${target}` : ""}${detail ? ` — ${detail}` : ""}`;
+				message = `${MUSE_TAG} ${glyph} \`${tool}\` ${outcome}${target ? ` on \`${target}\`` : ""}${detail ? ` — ${detail}` : ""}`;
 			}
 		} else {
 			let label: string;
-			if (kind === "reasoning") label = "[Muse] reasoning";
+			if (kind === "reasoning") label = `${MUSE_TAG} 💭 reasoning`;
 			else if (kind === "userShell") {
 				const command = text(item.commandText).replace(/\s+/g, " ").trim();
-				label = `[Muse] shell${command ? ` · ${command.length > 120 ? `${command.slice(0, 119)}…` : command}` : ""}`;
-			} else if (kind === "subagent") label = `[Muse] subagent${text(item.role) ? ` · ${text(item.role)}` : ""}`;
-			else if (kind === "workflow") label = `[Muse] workflow${text(item.scriptId) ? ` · ${text(item.scriptId)}` : ""}`;
-			else if (kind === "compaction") label = "[Muse] compaction";
-			else if (kind === "reminderChild") label = "[Muse] reminder";
-			else label = `[Muse] ${kind}`;
+				label = `${MUSE_TAG} ❯ shell${command ? ` \`${command.length > 120 ? `${command.slice(0, 119)}…` : command}\`` : ""}`;
+			} else if (kind === "subagent") label = `${MUSE_TAG} 🤖 subagent${text(item.role) ? ` \`${text(item.role)}\`` : ""}`;
+			else if (kind === "workflow") label = `${MUSE_TAG} ⚙ workflow${text(item.scriptId) ? ` \`${text(item.scriptId)}\`` : ""}`;
+			else if (kind === "compaction") label = `${MUSE_TAG} 🗜 compaction`;
+			else if (kind === "reminderChild") label = `${MUSE_TAG} ⏰ reminder`;
+			else label = `${MUSE_TAG} ${kind}`;
 			const suffix = (terminal ? TurnRun.resultSummary(item) : "") || fallback;
 			message = `${label} — ${status}${suffix ? `: ${suffix}` : ""}`;
 		}
@@ -436,7 +450,7 @@ export class TurnRun {
 				this.turnId = startedTurnId;
 			}
 			if (!startedTurnId || startedTurnId !== this.turnId) return;
-			this.onActivityDelta?.("\n\n[Muse] turn started\n");
+			this.onActivityDelta?.(`\n\n${MUSE_TAG} turn started\n`);
 			return;
 		}
 		if (method === "item/started" || method === "item/updated" || method === "item/completed") {
@@ -445,7 +459,7 @@ export class TurnRun {
 			const kind = item ? text(item.kind) : "";
 			if (!item || !itemId || !kind) return;
 			// The steered userMessage settles one outstanding steer whether it lands in this turn (B2) or the successor (B1).
-			if (method === "item/completed" && kind === "userMessage" && item.steered === true && this.outstandingSteers > 0) this.outstandingSteers--;
+			if (method === "item/completed" && kind === "userMessage" && item.steered === true) this.awaitingSteeredAnswer = false;
 			const existing = this.items.get(itemId);
 			const ownerTurnId = typeof item.turnId === "string" ? item.turnId : existing?.turnId;
 			if (this.turnId && ownerTurnId !== undefined && ownerTurnId !== this.turnId) return; // another turn's item: never streamed here
@@ -495,7 +509,7 @@ export class TurnRun {
 				errorText: error ? rpcErrorInfo(error)?.message : undefined,
 				interrupted: this.interrupted,
 			};
-			if (value.terminal === "completed" && this.outstandingSteers > 0 && !this.interrupted) {
+			if (value.terminal === "completed" && this.awaitingSteeredAnswer && !this.interrupted) {
 				// An accepted steer is still unanswered: the host will mint a successor run. Park the terminal until it
 				// completes (adopted in the turn/started branch); resolve as-is if no successor appears in time.
 				this.heldTerminal = value;
@@ -504,6 +518,7 @@ export class TurnRun {
 					const held = this.heldTerminal;
 					if (!held) return;
 					this.heldTerminal = undefined;
+					this.awaitingSteeredAnswer = false; // the hold is over; never re-arm it from stale state
 					this.diagnostics.push("Muse accepted a steer but started no successor run; the steered input was not answered in this turn");
 					this.resolveTerminal(held);
 				}, SUCCESSOR_GRACE_MS);
@@ -516,6 +531,7 @@ export class TurnRun {
 	private resolveTerminal(value: TurnTerminal): void {
 		if (this.terminalResolved) return;
 		this.terminalResolved = true;
+		this.awaitingSteeredAnswer = false;
 		this.terminalResolvers.resolve(value);
 	}
 
@@ -575,11 +591,21 @@ export class TurnRun {
 		return this.usage;
 	}
 
+	/**
+	 * Steerable only while this run owns a turn that is demonstrably still going. `heldTerminal` is the key
+	 * addition: after a `completed` terminal the run stays registered for the successor grace, and steering in that
+	 * window is exactly how a message meant for a brand-new turn got swallowed. `session/read` is deliberately NOT
+	 * consulted — it reports the stored record, which shows no active turn mid-flight, so it would refuse every
+	 * legitimate steer.
+	 */
+	private get steerable(): boolean {
+		return !this.settled && !this.terminalResolved && !this.interrupted && !this.heldTerminal && this.turnId !== undefined;
+	}
+
 	async steer(input: Frame[], expectedTurnId?: string, thinkingLevel?: MuseThinkingLevel): Promise<boolean> {
+		if (!this.steerable) return false;
 		const turnId = expectedTurnId ?? this.turnId;
-		// `interrupted` matters as much as `settled`: during the post-abort grace the run is still registered, and a
-		// message typed right after ESC must start a fresh turn instead of being swallowed as a steer.
-		if (!turnId || this.settled || this.terminalResolved || this.interrupted) return false;
+		if (!turnId) return false;
 		const reasoningEffort = museThinkingLevel(thinkingLevel) ?? this.reasoningEffort;
 		try {
 			await this.host.request("turn/steer", {
@@ -590,7 +616,9 @@ export class TurnRun {
 				...(reasoningEffort ? { reasoningEffort } : {}),
 			}, 10_000);
 			this.reasoningEffort = reasoningEffort;
-			this.outstandingSteers++;
+			// Boolean, not a counter: counters drift when steers are queued, rejected, or answered asymmetrically,
+			// and a stuck count re-arms the successor hold forever.
+			this.awaitingSteeredAnswer = true;
 			return true;
 		} catch (error) {
 			this.diagnostics.push(`Muse steer did not land (${errorMessage(error)}); input fell through to normal flow`);
@@ -615,6 +643,7 @@ export class TurnRun {
 
 	settle(): void {
 		this.settled = true;
+		this.awaitingSteeredAnswer = false;
 		clearTimeout(this.successorTimer);
 		this.successorTimer = undefined;
 		clearTimeout(this.abortTimer);
