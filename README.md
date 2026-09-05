@@ -9,6 +9,16 @@ restarts. The plugin does not add a subagent tool and does not need a modified s
 
 Version 0.4.3.
 
+## Screenshots
+
+Muse running in OMP:
+
+![Muse Bridge showing tool activity and a response in OMP](docs/screenshots/Muse-Bridge-Running.png)
+
+Muse's todo panel tracking progress across turns:
+
+![Muse Bridge todo panel showing pending, in-progress, and completed tasks](docs/screenshots/Muse-Bridge-Todo.png)
+
 ## Requirements
 
 - OMP with `@oh-my-pi/pi-ai`, `@oh-my-pi/pi-coding-agent`, and `@oh-my-pi/pi-utils` at version 18 or later
